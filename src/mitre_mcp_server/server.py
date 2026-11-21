@@ -3193,18 +3193,72 @@ async def get_techniques_used_by_group_software(
             g2s_formatted = [_format_rel_edge(r, include_description=include_description) for r in g2s_rels]
             s2t_formatted = [_format_rel_edge(r, include_description=include_description) for r in s2t_rels]
 
-            for r_edge in g2s_formatted + s2t_formatted:
+            direct_g2s = [
+                r
+                for r in g2s_formatted
+                if r.get("relationship_type") == "uses"
+                and r.get("source_ref") == group_stix_id
+                and r.get("target_ref") == sw_stix_id
+            ]
+            direct_s2t = [
+                r
+                for r in s2t_formatted
+                if r.get("relationship_type") == "uses"
+                and r.get("source_ref") == sw_stix_id
+                and r.get("target_ref") == t_stix_id
+            ]
+
+            camp_attr_by_id: Dict[str, List[Dict[str, Any]]] = {}
+            camp_uses_by_id: Dict[str, List[Dict[str, Any]]] = {}
+            for r in g2s_formatted:
+                src = str(r.get("source_ref") or "")
+                if not src.startswith("campaign--"):
+                    continue
+                if r.get("relationship_type") == "attributed-to" and r.get("target_ref") == group_stix_id:
+                    camp_attr_by_id.setdefault(src, []).append(r)
+                elif r.get("relationship_type") == "uses" and r.get("target_ref") == sw_stix_id:
+                    camp_uses_by_id.setdefault(src, []).append(r)
+
+            campaign_hops: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+            for camp_id in sorted(set(camp_attr_by_id) & set(camp_uses_by_id)):
+                for attr_edge in camp_attr_by_id[camp_id]:
+                    for c2s_edge in camp_uses_by_id[camp_id]:
+                        campaign_hops.append((camp_id, attr_edge, c2s_edge))
+
+            # Only record authentic direct 'uses' edges in top-level relationships;
+            # campaign-mediated links are recorded explicitly as indirect provenance paths.
+            for r_edge in direct_g2s + direct_s2t:
                 r_key = r_edge.get("stix_id") or (
                     f"{r_edge.get('source_ref')}->{r_edge.get('relationship_type')}->{r_edge.get('target_ref')}"
                 )
                 rel_map.setdefault(r_key, r_edge)
 
-            for g2s_edge in g2s_formatted or [None]:
-                for s2t_edge in s2t_formatted or [None]:
+            for s2t_edge in direct_s2t or [None]:
+                for g2s_edge in direct_g2s:
                     paths_list.append(
                         {
+                            "path_type": "direct",
                             "software": sw_info,
                             "group_uses_software": g2s_edge,
+                            "software_uses_technique": s2t_edge,
+                        }
+                    )
+                for camp_id, attr_edge, c2s_edge in campaign_hops:
+                    paths_list.append(
+                        {
+                            "path_type": "indirect_via_campaign",
+                            "software": sw_info,
+                            "campaign_stix_id": camp_id,
+                            "campaign_attributed_to_group": attr_edge,
+                            "campaign_uses_software": c2s_edge,
+                            "software_uses_technique": s2t_edge,
+                        }
+                    )
+                if not direct_g2s and not campaign_hops:
+                    paths_list.append(
+                        {
+                            "path_type": "indirect_unverified",
+                            "software": sw_info,
                             "software_uses_technique": s2t_edge,
                         }
                     )
@@ -3240,8 +3294,11 @@ async def get_techniques_used_by_group_software(
         paths_sorted = sorted(
             tech_paths.get(t_stix_id, []),
             key=lambda p: (
+                str(p.get("path_type") or ""),
                 str((p.get("software") or {}).get("stix_id") or ""),
                 str((p.get("group_uses_software") or {}).get("stix_id") or ""),
+                str(p.get("campaign_stix_id") or ""),
+                str((p.get("campaign_uses_software") or {}).get("stix_id") or ""),
                 str((p.get("software_uses_technique") or {}).get("stix_id") or ""),
             ),
         )

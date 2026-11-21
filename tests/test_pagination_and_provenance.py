@@ -262,9 +262,46 @@ class TestGroupSoftwareProvenanceAndRegressions(unittest.TestCase):
             )
         )
         self.assertEqual(res["count"], 205)
+        direct_paths_count = 0
+        indirect_paths_count = 0
         for tech in res["techniques"]:
             self.assertTrue(tech["relationships"], f"Empty relationships for {tech['stix_id']}")
             self.assertTrue(tech["provenance_paths"], f"Empty provenance_paths for {tech['stix_id']}")
+            for rel in tech["relationships"]:
+                self.assertEqual(rel["relationship_type"], "uses", f"Unexpected rel type in relationships: {rel}")
+                self.assertFalse(
+                    str(rel.get("source_ref") or "").startswith("campaign--"),
+                    f"Campaign edge leaked into top-level relationships: {rel}",
+                )
+            for path in tech["provenance_paths"]:
+                sw_id = path["software"]["stix_id"]
+                s2t = path["software_uses_technique"]
+                self.assertEqual(s2t["relationship_type"], "uses")
+                self.assertEqual(s2t["source_ref"], sw_id)
+                self.assertEqual(s2t["target_ref"], tech["stix_id"])
+                if path["path_type"] == "direct":
+                    direct_paths_count += 1
+                    g2s = path["group_uses_software"]
+                    self.assertEqual(g2s["relationship_type"], "uses")
+                    self.assertEqual(g2s["source_ref"], group_id)
+                    self.assertEqual(g2s["target_ref"], sw_id)
+                elif path["path_type"] == "indirect_via_campaign":
+                    indirect_paths_count += 1
+                    self.assertNotIn("group_uses_software", path)
+                    camp_id = path["campaign_stix_id"]
+                    attr = path["campaign_attributed_to_group"]
+                    c2s = path["campaign_uses_software"]
+                    self.assertEqual(attr["relationship_type"], "attributed-to")
+                    self.assertEqual(attr["source_ref"], camp_id)
+                    self.assertEqual(attr["target_ref"], group_id)
+                    self.assertEqual(c2s["relationship_type"], "uses")
+                    self.assertEqual(c2s["source_ref"], camp_id)
+                    self.assertEqual(c2s["target_ref"], sw_id)
+                else:
+                    self.fail(f"Unexpected path_type {path['path_type']} for APT29: {path}")
+
+        self.assertGreater(direct_paths_count, 0)
+        self.assertGreater(indirect_paths_count, 0)
 
         # Cross-verify a returned provenance path against both direct relationship APIs
         sample_tech = res["techniques"][0]
