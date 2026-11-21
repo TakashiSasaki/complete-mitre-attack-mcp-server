@@ -251,6 +251,52 @@ def _compute_data_stats() -> Dict[str, Any]:
 
     return stats
 
+def _unwrap_stix_object(item: Any) -> Any:
+    """Unwrap MitreAttackData {"object": obj, ...} wrapper if present."""
+    if isinstance(item, dict) and "object" in item and item["object"] is not None:
+        return item["object"]
+    return item
+
+
+def _stix_get(obj: Any, attr: str, default: Any = None) -> Any:
+    """Safely read a field from either a STIX object or a plain dict."""
+    obj = _unwrap_stix_object(obj)
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(attr, default)
+    return getattr(obj, attr, default)
+
+
+def _normalize_tactic_shortname(attack_data: Any, tactic: str) -> str:
+    """Resolve a tactic name, ATT&CK ID, or shortname to its x_mitre_shortname."""
+    raw = (tactic or "").strip()
+    norm = raw.lower()
+    try:
+        tactics = attack_data.get_tactics(remove_revoked_deprecated=True) or []
+    except Exception:
+        tactics = []
+    for t in tactics:
+        t_name = (_stix_get(t, "name", "") or "").strip()
+        t_short = (_stix_get(t, "x_mitre_shortname", "") or "").strip()
+        t_id = _stix_get(t, "id")
+        t_attack_id = None
+        if t_id:
+            try:
+                t_attack_id = attack_data.get_attack_id(t_id)
+            except Exception:
+                t_attack_id = None
+        if norm in {
+            t_name.lower(),
+            t_short.lower(),
+            (t_attack_id or "").lower(),
+            t_name.lower().replace(" ", "-"),
+        }:
+            if t_short:
+                return t_short
+    return norm.replace(" ", "-")
+
+
 def format_objects(
     objects: List[Any],
     include_description: bool = False,
@@ -271,43 +317,43 @@ def format_objects(
     formatted = []
 
     for obj in objects:
-
-        # Normalize {"object": x} format
-        if isinstance(obj, dict) and "object" in obj:
-            obj = obj["object"]
+        obj = _unwrap_stix_object(obj)
+        if obj is None:
+            continue
 
         lines = []
 
         # Name --------------------------------------------------------------
-        name = getattr(obj, "name", None)
+        name = _stix_get(obj, "name")
         if name:
             lines.append(f"Name: {name}")
 
+        # STIX ID -----------------------------------------------------------
+        stix_id = _stix_get(obj, "id")
+
         # External ATT&CK ID (e.g., T1059, G0032) ---------------------------
         try:
-            external_id = attack_data.get_attack_id(obj)
+            external_id = attack_data.get_attack_id(stix_id or obj)
             if external_id:
                 lines.append(f"ID: {external_id}")
         except Exception:
             pass  # not all objects map cleanly
 
-        # STIX ID -----------------------------------------------------------
-        stix_id = getattr(obj, "id", None)
         if stix_id:
             lines.append(f"STIX ID: {stix_id}")
 
         # Source reference (relationships only) -----------------------------
-        source_ref = getattr(obj, "source_ref", None)
+        source_ref = _stix_get(obj, "source_ref")
         if source_ref:
             lines.append(f"Source Reference: {source_ref}")
 
         # Aliases -----------------------------------------------------------
-        aliases = getattr(obj, "aliases", None)
+        aliases = _stix_get(obj, "aliases")
         if aliases:
             lines.append(f"Aliases: {aliases}")
 
         # Description -------------------------------------------------------
-        description = getattr(obj, "description", None)
+        description = _stix_get(obj, "description")
         if include_description and description:
             lines.append(f"Description: {description}")
 
@@ -880,9 +926,10 @@ async def get_techniques_by_tactic(
     """
     attack_data = get_attack_data(domain)
 
+    tactic_shortname = _normalize_tactic_shortname(attack_data, tactic)
     try:
         techniques = attack_data.get_techniques_by_tactic(
-            tactic,
+            tactic_shortname,
             f"{domain}-attack",
             remove_revoked_deprecated=True,
         )
@@ -2250,12 +2297,15 @@ async def get_techniques_used_by_group(
     technique_objects_for_format: List[Any] = []
 
     for entry in rel_entries:
-        if isinstance(entry, dict):
+        if isinstance(entry, dict) and "object" in entry:
             tech_obj = entry.get("object")
             rels = entry.get("relationships", [])
-        else:
+        elif hasattr(entry, "object"):
             tech_obj = getattr(entry, "object", None)
             rels = getattr(entry, "relationships", [])
+        else:
+            tech_obj = entry
+            rels = []
 
         if tech_obj is None:
             continue
@@ -2856,12 +2906,15 @@ async def get_techniques_used_by_group_software(
     technique_objects_for_format: List[Any] = []
 
     for entry in rel_entries:
-        if isinstance(entry, dict):
+        if isinstance(entry, dict) and "object" in entry:
             tech_obj = entry.get("object")
             rels = entry.get("relationships", [])
-        else:
+        elif hasattr(entry, "object"):
             tech_obj = getattr(entry, "object", None)
             rels = getattr(entry, "relationships", [])
+        else:
+            tech_obj = entry
+            rels = []
 
         if tech_obj is None:
             continue
@@ -5636,19 +5689,28 @@ async def get_techniques_targeting_asset(
 
     # Build machine-readable list
     out = []
-    for tech in techniques:
-        attack_id = attack_data.get_attack_id(tech.id)
+    unwrapped_techniques = []
+    for item in techniques:
+        tech = _unwrap_stix_object(item)
+        if tech is None:
+            continue
+        unwrapped_techniques.append(tech)
+        stix_id = _stix_get(tech, "id")
+        try:
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
+        except Exception:
+            attack_id = None
         out.append(
             {
                 "id": attack_id,
-                "name": getattr(tech, "name", None),
-                "stix_id": tech.id,
-                "description": getattr(tech, "description", None) if include_description else None,
+                "name": _stix_get(tech, "name"),
+                "stix_id": stix_id,
+                "description": _stix_get(tech, "description") if include_description else None,
             }
         )
 
     # Human-readable formatted block
-    formatted = format_objects(techniques, include_description=include_description, domain=domain)
+    formatted = format_objects(unwrapped_techniques, include_description=include_description, domain=domain)
 
     return {
         "found": True,
@@ -6570,13 +6632,23 @@ async def get_parent_technique_of_subtechnique(
     except Exception:
         sub_attack_id = None
 
-    # Try retrieving the parent STIX ID
+    # Try retrieving the parent entry / STIX ID
     try:
-        parent_stix_id = attack_data.get_parent_technique_of_subtechnique(technique_stix_id)
+        parent_raw = attack_data.get_parent_technique_of_subtechnique(technique_stix_id)
     except Exception:
-        parent_stix_id = None
+        parent_raw = None
 
-    if not parent_stix_id:
+    if isinstance(parent_raw, list):
+        parent_raw = parent_raw[0] if parent_raw else None
+
+    if isinstance(parent_raw, str):
+        parent_stix_id = parent_raw
+        parent_obj = attack_data.get_object_by_stix_id(parent_stix_id)
+    else:
+        parent_obj = _unwrap_stix_object(parent_raw)
+        parent_stix_id = _stix_get(parent_obj, "id") if parent_obj is not None else None
+
+    if parent_obj is None or not parent_stix_id:
         return {
             "subtechnique_stix_id": technique_stix_id,
             "subtechnique_attack_id": sub_attack_id,
@@ -6588,22 +6660,9 @@ async def get_parent_technique_of_subtechnique(
             ),
         }
 
-    # Load the parent technique object
-    parent_obj = attack_data.get_object_by_stix_id(parent_stix_id)
-    if parent_obj is None:
-        return {
-            "subtechnique_stix_id": technique_stix_id,
-            "subtechnique_attack_id": sub_attack_id,
-            "parent": None,
-            "formatted": "",
-            "message": (
-                f"Parent STIX ID '{parent_stix_id}' not found in domain '{domain}'."
-            ),
-        }
-
     # Extract parent attributes
-    parent_name = getattr(parent_obj, "name", None)
-    parent_desc = getattr(parent_obj, "description", None) if include_description else None
+    parent_name = _stix_get(parent_obj, "name")
+    parent_desc = _stix_get(parent_obj, "description") if include_description else None
 
     try:
         parent_attack_id = attack_data.get_attack_id(parent_stix_id)
@@ -6703,11 +6762,19 @@ async def get_subtechniques_of_technique(
 
     # Convert subtechniques to structured form
     sub_list = []
-    for obj in subs:
-        stix_id = obj.id
-        name = getattr(obj, "name", None)
-        attack_id = attack_data.get_attack_id(stix_id)
-        desc = getattr(obj, "description", None) if include_description else None
+    unwrapped_subs = []
+    for item in subs:
+        obj = _unwrap_stix_object(item)
+        if obj is None:
+            continue
+        unwrapped_subs.append(obj)
+        stix_id = _stix_get(obj, "id")
+        name = _stix_get(obj, "name")
+        try:
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
+        except Exception:
+            attack_id = None
+        desc = _stix_get(obj, "description") if include_description else None
 
         sub_list.append(
             {
@@ -6720,7 +6787,7 @@ async def get_subtechniques_of_technique(
 
     # Human-readable formatting
     formatted = format_objects(
-        subs,
+        unwrapped_subs,
         include_description=include_description,
         domain=domain,
     )
@@ -7643,16 +7710,19 @@ async def get_procedure_examples_by_tactic(
     except Exception:
         all_tactics = []
 
+    tactic_shortname = _normalize_tactic_shortname(attack_data, tactic)
     for t in all_tactics:
-        t_name = getattr(t, "name", "") or ""
-        if t_name.lower() == tactic_name_norm:
-            tactic_stix_id = getattr(t, "id", None)
+        t_name = (_stix_get(t, "name", "") or "").strip()
+        t_short = (_stix_get(t, "x_mitre_shortname", "") or "").strip()
+        if tactic_name_norm in {t_name.lower(), t_short.lower()} or tactic_shortname == t_short.lower():
+            tactic_stix_id = _stix_get(t, "id")
             try:
                 tactic_attack_id = attack_data.get_attack_id(tactic_stix_id)
             except Exception:
                 tactic_attack_id = None
-            # Normalize to canonical name from ATT&CK
-            tactic_name_input = t_name
+            tactic_name_input = t_name or tactic_name_input
+            if t_short:
+                tactic_shortname = t_short
             break
 
     tactic_info = {
@@ -7661,9 +7731,27 @@ async def get_procedure_examples_by_tactic(
         "stix_id": tactic_stix_id,
     }
 
-    # --- Get procedure examples from MITRE helper ---
+    # --- Aggregate procedure examples across all techniques in this tactic ---
+    examples = []
+    seen_rel_ids = set()
     try:
-        examples = attack_data.get_procedure_examples_by_tactic(tactic_name_input) or []
+        tactic_techniques = attack_data.get_techniques_by_tactic(
+            tactic_shortname,
+            f"{domain}-attack",
+            remove_revoked_deprecated=True,
+        ) or []
+        for tech in tactic_techniques:
+            tech_id = _stix_get(tech, "id")
+            if not tech_id:
+                continue
+            for rel in attack_data.get_procedure_examples_by_technique(tech_id) or []:
+                rel_obj = _unwrap_stix_object(rel)
+                rel_id = _stix_get(rel_obj, "id")
+                if rel_id and rel_id in seen_rel_ids:
+                    continue
+                if rel_id:
+                    seen_rel_ids.add(rel_id)
+                examples.append(rel_obj)
     except Exception:
         examples = []
 
@@ -7683,10 +7771,10 @@ async def get_procedure_examples_by_tactic(
 
     for rel in examples:
         # Relationship itself (procedure example)
-        rel_id = getattr(rel, "id", None)
-        rel_desc = getattr(rel, "description", None) if include_description else None
-        source_ref = getattr(rel, "source_ref", None)
-        target_ref = getattr(rel, "target_ref", None)
+        rel_id = _stix_get(rel, "id")
+        rel_desc = _stix_get(rel, "description") if include_description else None
+        source_ref = _stix_get(rel, "source_ref")
+        target_ref = _stix_get(rel, "target_ref")
 
         # Resolve source group
         group_info = {
@@ -7921,10 +8009,33 @@ async def get_tactics_by_matrix(
     """
     attack_data = get_attack_data(domain)
 
+    matrix_name = None
     try:
-        tactics = attack_data.get_tactics_by_matrix(matrix_stix_id) or []
+        matrix_obj = attack_data.get_object_by_stix_id(matrix_stix_id)
+        matrix_name = _stix_get(matrix_obj, "name") if matrix_obj is not None else None
     except Exception:
-        tactics = []
+        matrix_name = None
+
+    try:
+        tactics_map = attack_data.get_tactics_by_matrix() or {}
+    except Exception:
+        tactics_map = {}
+
+    tactics = []
+    if isinstance(tactics_map, dict):
+        if matrix_name and matrix_name in tactics_map:
+            tactics = tactics_map[matrix_name]
+        elif matrix_stix_id in tactics_map:
+            tactics = tactics_map[matrix_stix_id]
+        elif matrix_name:
+            for k, v in tactics_map.items():
+                if k.lower() == matrix_name.lower():
+                    tactics = v
+                    break
+        elif not matrix_stix_id and len(tactics_map) == 1:
+            tactics = next(iter(tactics_map.values()))
+    elif isinstance(tactics_map, list):
+        tactics = tactics_map
 
     if not tactics:
         return {
@@ -7937,18 +8048,18 @@ async def get_tactics_by_matrix(
 
     results = []
     for tac in tactics:
-        stix_id = tac.id
+        stix_id = _stix_get(tac, "id")
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
         results.append(
             {
-                "name": getattr(tac, "name", None),
+                "name": _stix_get(tac, "name"),
                 "stix_id": stix_id,
                 "attack_id": attack_id,
-                "description": getattr(tac, "description", None) if include_description else None,
+                "description": _stix_get(tac, "description") if include_description else None,
             }
         )
 
@@ -8107,20 +8218,23 @@ async def get_objects_created_after(
 
     # Build structured response
     results = []
-    for obj in objects:
+    for item in objects:
+        obj = _unwrap_stix_object(item)
+        stix_id = _stix_get(obj, "id")
         attack_id = None
         try:
-            attack_id = attack_data.get_attack_id(obj.id)
+            if stix_id:
+                attack_id = attack_data.get_attack_id(stix_id)
         except Exception:
             pass
 
         results.append(
             {
                 "id": attack_id,
-                "name": getattr(obj, "name", None),
-                "stix_id": obj.id,
-                "type": getattr(obj, "type", None),
-                "description": getattr(obj, "description", None)
+                "name": _stix_get(obj, "name"),
+                "stix_id": stix_id,
+                "type": _stix_get(obj, "type"),
+                "description": _stix_get(obj, "description")
                 if include_description
                 else None,
             }
@@ -8192,19 +8306,21 @@ async def get_objects_modified_after(
 
     # Build structured response
     results: list[Dict[str, Any]] = []
-    for obj in objects:
+    for item in objects:
+        obj = _unwrap_stix_object(item)
+        stix_id = _stix_get(obj, "id")
         try:
-            attack_id = attack_data.get_attack_id(obj.id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
         results.append(
             {
                 "id": attack_id,
-                "name": getattr(obj, "name", None),
-                "stix_id": getattr(obj, "id", None),
-                "type": getattr(obj, "type", None),
-                "description": getattr(obj, "description", None)
+                "name": _stix_get(obj, "name"),
+                "stix_id": stix_id,
+                "type": _stix_get(obj, "type"),
+                "description": _stix_get(obj, "description")
                 if include_description
                 else None,
             }
@@ -8260,7 +8376,7 @@ async def get_revoked_techniques(
         }
 
     # Filter revoked only
-    revoked = [t for t in all_techniques if getattr(t, "revoked", False)]
+    revoked = [t for t in all_techniques if _stix_get(t, "revoked", False)]
 
     if not revoked:
         return {
@@ -8274,18 +8390,19 @@ async def get_revoked_techniques(
     # Build structured output
     output_items = []
     for tech in revoked:
+        stix_id = _stix_get(tech, "id")
         try:
-            attack_id = attack_data.get_attack_id(tech.id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
         output_items.append(
             {
                 "id": attack_id,
-                "name": getattr(tech, "name", None),
-                "stix_id": getattr(tech, "id", None),
+                "name": _stix_get(tech, "name"),
+                "stix_id": stix_id,
                 "revoked": True,
-                "description": getattr(tech, "description", None)
+                "description": _stix_get(tech, "description")
                 if include_description
                 else None,
             }
