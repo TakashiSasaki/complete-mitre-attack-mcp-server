@@ -7655,6 +7655,8 @@ async def get_procedure_examples_by_tactic(
     tactic: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    limit: int = 100,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all procedure examples for techniques in a specific tactic.
@@ -7767,9 +7769,14 @@ async def get_procedure_examples_by_tactic(
             ),
         }
 
+    total_count = len(examples)
+    safe_offset = max(0, offset)
+    safe_limit = max(1, min(limit, 500))
+    page_examples = examples[safe_offset : safe_offset + safe_limit]
+
     example_entries: list[Dict[str, Any]] = []
 
-    for rel in examples:
+    for rel in page_examples:
         # Relationship itself (procedure example)
         rel_id = _stix_get(rel, "id")
         rel_desc = _stix_get(rel, "description") if include_description else None
@@ -7837,19 +7844,25 @@ async def get_procedure_examples_by_tactic(
 
     # --- Human-readable formatted block (for LLMs / humans) ---
     formatted = format_objects(
-        examples,
+        page_examples,
         include_description=include_description,
         domain=domain,
     )
+    has_more = (safe_offset + len(example_entries)) < total_count
 
     return {
         "tactic": tactic_info,
         "count": len(example_entries),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": safe_offset + len(example_entries) if has_more else None,
         "examples": example_entries,
         "formatted": formatted,
         "message": (
-            f"Found {len(example_entries)} procedure example(s) for tactic "
-            f"'{tactic_info['name']}' in domain '{domain}'."
+            f"Showing {len(example_entries)} of {total_count} procedure example(s) "
+            f"(offset={safe_offset}) for tactic '{tactic_info['name']}' in domain '{domain}'."
         ),
     }
 
@@ -8168,6 +8181,8 @@ async def get_objects_created_after(
     timestamp: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    limit: int = 100,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK objects created after a specific timestamp.
@@ -8216,9 +8231,14 @@ async def get_objects_created_after(
             "message": f"No objects created after '{timestamp}' in domain '{domain}'.",
         }
 
+    total_count = len(objects)
+    safe_offset = max(0, offset)
+    safe_limit = max(1, min(limit, 500))
+    page_objects = objects[safe_offset : safe_offset + safe_limit]
+
     # Build structured response
     results = []
-    for item in objects:
+    for item in page_objects:
         obj = _unwrap_stix_object(item)
         stix_id = _stix_get(obj, "id")
         attack_id = None
@@ -8241,14 +8261,20 @@ async def get_objects_created_after(
         )
 
     # Pretty printed human-friendly block
-    formatted = format_objects(objects, include_description=include_description, domain=domain)
+    formatted = format_objects(page_objects, include_description=include_description, domain=domain)
+    has_more = (safe_offset + len(results)) < total_count
 
     return {
         "found": True,
         "count": len(results),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": safe_offset + len(results) if has_more else None,
         "objects": results,
         "formatted": formatted,
-        "message": f"Found {len(results)} objects created after {timestamp}.",
+        "message": f"Showing {len(results)} of {total_count} objects created after {timestamp} (offset={safe_offset}).",
     }
 
 @mcp.tool()
@@ -8256,6 +8282,8 @@ async def get_objects_modified_after(
     timestamp: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    limit: int = 100,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK objects modified after a specific timestamp.
@@ -8304,9 +8332,14 @@ async def get_objects_modified_after(
             "message": f"No objects modified after '{timestamp}' in domain '{domain}'.",
         }
 
+    total_count = len(objects)
+    safe_offset = max(0, offset)
+    safe_limit = max(1, min(limit, 500))
+    page_objects = objects[safe_offset : safe_offset + safe_limit]
+
     # Build structured response
     results: list[Dict[str, Any]] = []
-    for item in objects:
+    for item in page_objects:
         obj = _unwrap_stix_object(item)
         stix_id = _stix_get(obj, "id")
         try:
@@ -8328,17 +8361,23 @@ async def get_objects_modified_after(
 
     # Human-readable formatted output
     formatted = format_objects(
-        objects,
+        page_objects,
         include_description=include_description,
         domain=domain,
     )
+    has_more = (safe_offset + len(results)) < total_count
 
     return {
         "found": True,
         "count": len(results),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": safe_offset + len(results) if has_more else None,
         "objects": results,
         "formatted": formatted,
-        "message": f"Found {len(results)} objects modified after {timestamp}.",
+        "message": f"Showing {len(results)} of {total_count} objects modified after {timestamp} (offset={safe_offset}).",
     }
 
 @mcp.tool()
