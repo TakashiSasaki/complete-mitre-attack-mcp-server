@@ -1411,21 +1411,34 @@ async def get_stix_type(
     attack_data = get_attack_data(domain)
 
     try:
-        stix_type = attack_data.get_stix_type(stix_id)
+        parsed_type = attack_data.get_stix_type(stix_id)
     except Exception:
-        stix_type = None
+        parsed_type = None
 
-    if stix_type is None:
+    try:
+        obj = attack_data.get_object_by_stix_id(stix_id)
+    except Exception:
+        obj = None
+
+    if obj is None:
         return {
             "found": False,
+            "exists_in_domain": False,
             "stix_type": None,
-            "message": f"No STIX object found for ID '{stix_id}' in domain '{domain}'.",
+            "parsed_type": parsed_type,
+            "message": (
+                f"No STIX object found for ID '{stix_id}' in domain '{domain}'"
+                + (f" (ID prefix parses as '{parsed_type}')." if parsed_type else ".")
+            ),
         }
 
+    actual_type = _stix_get(obj, "type") or parsed_type
     return {
         "found": True,
-        "stix_type": stix_type,
-        "message": f"STIX object type for '{stix_id}' is '{stix_type}'.",
+        "exists_in_domain": True,
+        "stix_type": actual_type,
+        "parsed_type": parsed_type,
+        "message": f"STIX object type for '{stix_id}' is '{actual_type}'.",
     }
 
 @mcp.tool()
@@ -2839,21 +2852,18 @@ async def get_campaigns_attributed_to_group(
     structured_campaigns = []
     campaign_objects_for_format = []
 
-    for c in campaign_entries:
-        if isinstance(c, dict):
-            name = c.get("name")
-            stix_id = c.get("id")
-            desc = c.get("description") if include_description else None
-        else:
-            name = getattr(c, "name", None)
-            stix_id = getattr(c, "id", None)
-            desc = getattr(c, "description", None) if include_description else None
+    for item in campaign_entries:
+        c = _unwrap_stix_object(item)
+        if c is None:
+            continue
+        name = _stix_get(c, "name")
+        stix_id = _stix_get(c, "id")
+        desc = _stix_get(c, "description") if include_description else None
 
-        # Save for formatted output
         campaign_objects_for_format.append(c)
 
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
@@ -5770,20 +5780,24 @@ async def get_assets_targeted_by_technique(
 
     # --- Build the structured list of assets ---
     asset_entries = []
-    for a in assets:
-        if isinstance(a, dict):
-            name = a.get("name")
-            stix_id = a.get("id")
-            desc = a.get("description") if include_description else None
-            asset_type = a.get("x_mitre_asset_type")
-        else:
-            name = getattr(a, "name", None)
-            stix_id = getattr(a, "id", None)
-            desc = getattr(a, "description", None) if include_description else None
-            asset_type = getattr(a, "x_mitre_asset_type", None)
+    unwrapped_assets = []
+    for item in assets:
+        a = _unwrap_stix_object(item)
+        if a is None:
+            continue
+        unwrapped_assets.append(a)
+        name = _stix_get(a, "name")
+        stix_id = _stix_get(a, "id")
+        desc = _stix_get(a, "description") if include_description else None
+        asset_type = _stix_get(a, "x_mitre_asset_type")
+        try:
+            a_attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
+        except Exception:
+            a_attack_id = None
 
         asset_entries.append(
             {
+                "attack_id": a_attack_id,
                 "name": name,
                 "stix_id": stix_id,
                 "description": desc,
@@ -5793,7 +5807,7 @@ async def get_assets_targeted_by_technique(
 
     # --- Human-readable formatting ---
     formatted = format_objects(
-        assets,
+        unwrapped_assets,
         include_description=include_description,
         domain=domain,
     )
@@ -7109,13 +7123,18 @@ async def get_techniques_mitigated_by_mitigation(
 
     # --- Build list of technique entries ---
     technique_entries = []
-    for t in techniques:
-        stix_id = getattr(t, "id", None)
-        name = getattr(t, "name", None)
-        desc = getattr(t, "description", None) if include_description else None
+    unwrapped_techs = []
+    for item in techniques:
+        t = _unwrap_stix_object(item)
+        if t is None:
+            continue
+        unwrapped_techs.append(t)
+        stix_id = _stix_get(t, "id")
+        name = _stix_get(t, "name")
+        desc = _stix_get(t, "description") if include_description else None
 
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
@@ -7129,7 +7148,7 @@ async def get_techniques_mitigated_by_mitigation(
         )
 
     formatted = format_objects(
-        techniques,
+        unwrapped_techs,
         include_description=include_description,
         domain=domain,
     )
@@ -8835,96 +8854,111 @@ async def generate_layer(
             "message": f"STIX data for domain '{domain}' is not available.",
         }
 
-    # Generate Navigator layer
+    # Generate Navigator layer directly from loaded MitreAttackData for complete v20.1 accuracy
     try:
-        layer_dict = None
-        count = 0
+        ad = get_attack_data(domain)
+        src_obj = None
+        raw_items: List[Any] = []
+        relation_label = "Associated with"
 
-        if attack_id.startswith("DC"):
-            # ATT&CK v20.1 data component layer via DetectionStrategy -> Analytic -> DataComponent graph
-            ad = get_attack_data(domain)
-            dc_obj = ad.get_object_by_attack_id(attack_id, "x-mitre-data-component")
-            if dc_obj is not None:
-                dc_stix_id = _stix_get(dc_obj, "id")
+        if attack_id.startswith("G"):
+            src_obj = ad.get_object_by_attack_id(attack_id, "intrusion-set")
+            if src_obj is not None:
+                raw_items = ad.get_techniques_used_by_group(_stix_get(src_obj, "id")) or []
+                relation_label = "Used by group"
+        elif attack_id.startswith("M"):
+            src_obj = ad.get_object_by_attack_id(attack_id, "course-of-action")
+            if src_obj is not None:
+                raw_items = ad.get_techniques_mitigated_by_mitigation(_stix_get(src_obj, "id")) or []
+                relation_label = "Mitigated by"
+        elif attack_id.startswith("S"):
+            src_obj = ad.get_object_by_attack_id(attack_id, "malware") or ad.get_object_by_attack_id(attack_id, "tool")
+            if src_obj is not None:
+                raw_items = ad.get_techniques_used_by_software(_stix_get(src_obj, "id")) or []
+                relation_label = "Used by software"
+        elif attack_id.startswith("DC") or attack_id.startswith("D"):
+            src_obj = ad.get_object_by_attack_id(attack_id, "x-mitre-data-component")
+            if src_obj is not None:
+                dc_stix_id = _stix_get(src_obj, "id")
                 v20_idx = _get_v20_detection_index(domain)
-                tech_ids = v20_idx["dc_to_techs"].get(dc_stix_id, [])
-                tech_entries = []
-                for tid in tech_ids:
+                for tid in v20_idx["dc_to_techs"].get(dc_stix_id, []):
                     tobj = ad.get_object_by_stix_id(tid)
-                    if tobj is None or _stix_get(tobj, "revoked", False) or _stix_get(tobj, "x_mitre_deprecated", False):
-                        continue
-                    t_aid = ad.get_attack_id(tid)
-                    if not t_aid:
-                        continue
-                    tech_entries.append({
-                        "techniqueID": t_aid,
-                        "score": score,
-                        "comment": f"Detected via {_stix_get(dc_obj, 'name')} ({attack_id})",
-                        "enabled": True,
-                    })
-                if tech_entries:
-                    layer_dict = {
-                        "name": f"{_stix_get(dc_obj, 'name')} ({attack_id})",
-                        "versions": {
-                            "attack": str(release_info.LATEST_VERSION),
-                            "navigator": "5.1.0",
-                            "layer": "4.5",
-                        },
-                        "domain": f"{domain}-attack",
-                        "description": f"Techniques detected by data component {_stix_get(dc_obj, 'name')} ({attack_id}) in ATT&CK v{release_info.LATEST_VERSION}.",
-                        "layout": {
-                            "layout": "side",
-                            "aggregateFunction": "average",
-                            "expandedSubtechniques": "none",
-                        },
-                        "gradient": {
-                            "colors": ["#ffffff", "#66b1ff"],
-                            "minValue": 0,
-                            "maxValue": max(score, 1),
-                        },
-                        "techniques": tech_entries,
-                    }
-                    count = len(tech_entries)
-        else:
-            generator = UsageLayerGenerator(
-                source="local",
-                domain=domain,
-                resource=str(stix_path),
-            )
-            layer_obj = generator.generate_layer(match=attack_id)
-            if layer_obj and layer_obj.layer and layer_obj.layer.techniques:
-                layer_obj.layer.techniques = [
-                    t for t in layer_obj.layer.techniques if getattr(t, "score", 0) > 0
-                ]
-                for t in layer_obj.layer.techniques:
-                    t.score = score
-                    if isinstance(getattr(t, "comment", None), str) and len(t.comment) > 200:
-                        t.comment = t.comment[:197] + "..."
-                layer_dict = layer_obj.to_dict()
-                layer_dict.setdefault("versions", {
-                    "attack": str(release_info.LATEST_VERSION),
-                    "navigator": "5.1.0",
-                    "layer": "4.5",
-                })
-                layer_dict["versions"]["attack"] = str(release_info.LATEST_VERSION)
-                layer_dict.setdefault("layout", {
-                    "layout": "side",
-                    "aggregateFunction": "average",
-                    "expandedSubtechniques": "none",
-                })
-                count = len(layer_obj.layer.techniques)
+                    if tobj is not None:
+                        raw_items.append(tobj)
+                if not raw_items:
+                    raw_items = ad.get_techniques_detected_by_datacomponent(dc_stix_id) or []
+                relation_label = "Detected via data component"
 
-        if not layer_dict or count == 0:
+        if src_obj is None:
             return {
                 "success": False,
                 "attack_id": attack_id,
                 "domain": domain,
                 "count": 0,
                 "layer": None,
-                "message": (
-                    f"No techniques found for '{attack_id}' in domain '{domain}'."
-                ),
+                "message": f"ATT&CK object '{attack_id}' was not found in domain '{domain}'.",
             }
+
+        src_name = _stix_get(src_obj, "name") or attack_id
+        seen_tids = set()
+        tech_entries: List[Dict[str, Any]] = []
+        for item in raw_items:
+            tobj = _unwrap_stix_object(item)
+            if tobj is None or _stix_get(tobj, "revoked", False) or _stix_get(tobj, "x_mitre_deprecated", False):
+                continue
+            tid = _stix_get(tobj, "id")
+            t_aid = ad.get_attack_id(tid) if tid else None
+            if not t_aid or t_aid in seen_tids:
+                continue
+            seen_tids.add(t_aid)
+
+            # Extract concise comment from relationship description if present
+            comment = f"{relation_label} {src_name} ({attack_id})"
+            if isinstance(item, dict) and item.get("relationships"):
+                r_desc = _stix_get(item["relationships"][0], "description")
+                if isinstance(r_desc, str) and r_desc.strip():
+                    clean_desc = " ".join(r_desc.strip().split())
+                    comment = clean_desc[:197] + "..." if len(clean_desc) > 200 else clean_desc
+
+            tech_entries.append({
+                "techniqueID": t_aid,
+                "score": score,
+                "comment": comment,
+                "enabled": True,
+            })
+
+        if not tech_entries:
+            return {
+                "success": False,
+                "attack_id": attack_id,
+                "domain": domain,
+                "count": 0,
+                "layer": None,
+                "message": f"No active techniques found for '{attack_id}' ({src_name}) in domain '{domain}'.",
+            }
+
+        layer_dict = {
+            "name": f"{src_name} ({attack_id})",
+            "versions": {
+                "attack": str(release_info.LATEST_VERSION),
+                "navigator": "5.1.0",
+                "layer": "4.5",
+            },
+            "domain": f"{domain}-attack",
+            "description": f"ATT&CK Navigator layer for {src_name} ({attack_id}) in {domain} v{release_info.LATEST_VERSION}.",
+            "layout": {
+                "layout": "side",
+                "aggregateFunction": "average",
+                "expandedSubtechniques": "none",
+            },
+            "gradient": {
+                "colors": ["#ffffff", "#66b1ff"],
+                "minValue": 0,
+                "maxValue": max(score, 1),
+            },
+            "techniques": tech_entries,
+        }
+        count = len(tech_entries)
 
         return {
             "success": True,
@@ -9011,7 +9045,7 @@ async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
         },
         "ics": {
             "domain": "ics-attack",
-            "filters": {"platforms": ["None"]},
+            "filters": {"platforms": ["Embedded", "Linux", "Network Devices", "Windows"]},
         },
     }
 
