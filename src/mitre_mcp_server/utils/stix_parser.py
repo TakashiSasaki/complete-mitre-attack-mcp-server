@@ -349,16 +349,21 @@ class MITREDataManager:
         attack_data = self.get_attack_data(domain)
         groups = attack_data.get_groups(remove_revoked_deprecated=True)
         
-        query_lower = group_name.lower()
-        
+        query_lower = (group_name or "").strip().lower()
+        if not query_lower:
+            return None
+
+        partial_match = None
         for group in groups:
             name = group.name.lower() if hasattr(group, 'name') else ""
             aliases = [alias.lower() for alias in getattr(group, 'aliases', [])]
-            
-            if query_lower in name or query_lower in ' '.join(aliases):
+
+            if query_lower == name or query_lower in aliases:
                 return group
-        
-        return None
+            if partial_match is None and (query_lower in name or any(query_lower in a for a in aliases)):
+                partial_match = group
+
+        return partial_match
     
     def get_stix_type(
         self,

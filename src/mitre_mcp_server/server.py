@@ -721,9 +721,11 @@ async def get_object_by_attack_id(
         }
     """
     attack_data = get_attack_data(domain)
+    norm_id = (attack_id or "").strip().upper()
+    norm_type = (stix_type or "").strip().lower()
 
     try:
-        obj = attack_data.get_object_by_attack_id(attack_id, stix_type)
+        obj = attack_data.get_object_by_attack_id(norm_id, norm_type)
     except Exception:
         obj = None
 
@@ -733,8 +735,8 @@ async def get_object_by_attack_id(
             "object": None,
             "formatted": "",
             "message": (
-                f"No object found for ATT&CK ID '{attack_id}' with STIX type "
-                f"'{stix_type}' in domain '{domain}'."
+                f"No object found for ATT&CK ID '{norm_id}' with STIX type "
+                f"'{norm_type}' in domain '{domain}'."
             ),
         }
 
@@ -746,6 +748,12 @@ async def get_object_by_attack_id(
         if include_description and not isinstance(obj, dict)
         else (obj.get("description") if include_description else None)
     )
+    resolved_id = norm_id
+    if stix_id:
+        try:
+            resolved_id = attack_data.get_attack_id(stix_id) or norm_id
+        except Exception:
+            resolved_id = norm_id
 
     formatted = format_objects(
         [obj],
@@ -756,14 +764,14 @@ async def get_object_by_attack_id(
     return {
         "found": True,
         "object": {
-            "id": attack_id,
+            "id": resolved_id,
             "name": name,
             "stix_id": stix_id,
-            "type": stix_type,
+            "type": norm_type,
             "description": description,
         },
         "formatted": formatted,
-        "message": f"Object found for ATT&CK ID '{attack_id}' in domain '{domain}'.",
+        "message": f"Object found for ATT&CK ID '{resolved_id}' in domain '{domain}'.",
     }
 
 @mcp.tool()
@@ -860,9 +868,10 @@ async def get_objects_by_name(
     stix_type: str,
     domain: str = "enterprise",
     include_description: bool = False,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
-    Retrieve MITRE ATT&CK objects by exact name match (case-sensitive).
+    Retrieve MITRE ATT&CK objects by exact name match (case-insensitive).
 
     This tool performs an exact name match for a specific STIX type within
     a given ATT&CK domain. It is more strict than generic search methods,
@@ -874,13 +883,14 @@ async def get_objects_by_name(
         - Malware: get_objects_by_name("Cobalt Strike", "malware")
 
     Args:
-        name: Exact object name to search for (case-sensitive).
+        name: Exact object name to search for (case-insensitive).
         stix_type: STIX object type (same values as get_object_by_attack_id),
                    e.g. "attack-pattern", "intrusion-set", "malware",
                    "tool", "course-of-action", etc.
         domain: ATT&CK domain ("enterprise", "mobile", or "ics").
         include_description: Whether to include descriptions in the formatted output
                              and structured result.
+        remove_revoked_deprecated: Whether to exclude revoked and deprecated objects (default: True).
 
     Returns:
         {
@@ -900,9 +910,17 @@ async def get_objects_by_name(
         }
     """
     attack_data = get_attack_data(domain)
+    norm_type = (stix_type or "").strip().lower()
+    norm_name = (name or "").strip().lower()
 
     try:
-        objs = attack_data.get_objects_by_name(name, stix_type)
+        candidates = attack_data.get_objects_by_type(
+            norm_type, remove_revoked_deprecated=remove_revoked_deprecated
+        ) or []
+        objs = [
+            obj for obj in candidates
+            if ((_stix_get(obj, "name", "") or "").strip().lower() == norm_name)
+        ]
     except Exception:
         objs = []
 
@@ -912,7 +930,7 @@ async def get_objects_by_name(
             "objects": [],
             "formatted": "",
             "message": (
-                f"No objects found with name '{name}' and type '{stix_type}' "
+                f"No objects found with name '{name}' and type '{norm_type}' "
                 f"in domain '{domain}'."
             ),
         }
@@ -974,6 +992,7 @@ async def get_objects_by_content(
     object_type: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Search MITRE ATT&CK objects by matching text inside their description field.
@@ -998,6 +1017,7 @@ async def get_objects_by_content(
             - etc.
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to return descriptions in the structured output.
+        remove_revoked_deprecated: Whether to exclude revoked and deprecated objects (default: True).
 
     Returns:
         {
@@ -1017,10 +1037,15 @@ async def get_objects_by_content(
         }
     """
     attack_data = get_attack_data(domain)
+    norm_type = (object_type or "").strip().lower()
 
     # Perform text search
     try:
-        objs = attack_data.get_objects_by_content(content, object_type)
+        objs = attack_data.get_objects_by_content(
+            content,
+            norm_type,
+            remove_revoked_deprecated=remove_revoked_deprecated,
+        )
     except Exception:
         objs = []
 
@@ -1684,26 +1709,26 @@ async def get_group_techniques(
     """
     attack_data = get_attack_data(domain)
 
-    # --- 1) Find the group by name or alias (same semantics as get_group_by_name) ---
+    # --- 1) Find the group by name or alias (exact match first, same semantics as get_group_by_name) ---
     try:
         groups = attack_data.get_groups(remove_revoked_deprecated=True)
     except Exception:
         groups = []
 
-    query = group_name.lower()
-    group = None
+    query = (group_name or "").strip().lower()
+    exact_matches = []
+    partial_matches = []
 
     for grp in groups:
-        if isinstance(grp, dict):
-            name = (grp.get("name") or "").lower()
-            aliases = [a.lower() for a in grp.get("aliases", [])]
-        else:
-            name = (getattr(grp, "name", "") or "").lower()
-            aliases = [a.lower() for a in getattr(grp, "aliases", [])]
+        name = (_stix_get(grp, "name", "") or "").lower()
+        aliases = [a.lower() for a in (_stix_get(grp, "aliases", []) or [])]
 
-        if query in name or any(query in alias for alias in aliases):
-            group = grp
-            break
+        if query and (query == name or query in aliases):
+            exact_matches.append(grp)
+        elif query and (query in name or any(query in alias for alias in aliases)):
+            partial_matches.append(grp)
+
+    group = exact_matches[0] if exact_matches else (partial_matches[0] if partial_matches else None)
 
     if group is None:
         return {
@@ -8608,6 +8633,7 @@ async def get_objects_created_after(
     timestamp: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
     limit: Annotated[
         int,
         Field(
@@ -8651,20 +8677,26 @@ async def get_objects_created_after(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
     # Try to fetch objects
     try:
-        objects = attack_data.get_objects_created_after(timestamp) or []
+        objects = attack_data.get_objects_created_after(
+            timestamp, remove_revoked_deprecated=remove_revoked_deprecated
+        ) or []
     except Exception as e:
         return {
             "found": False,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "objects": [],
             "formatted": "",
             "message": f"Error retrieving objects created after {timestamp}: {e}",
         }
-
-    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
     if not objects:
         return {
@@ -8736,6 +8768,7 @@ async def get_objects_modified_after(
     timestamp: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
     limit: Annotated[
         int,
         Field(
@@ -8779,20 +8812,26 @@ async def get_objects_modified_after(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
     # Try to fetch objects
     try:
-        objects = attack_data.get_objects_modified_after(timestamp) or []
+        objects = attack_data.get_objects_modified_after(
+            timestamp, remove_revoked_deprecated=remove_revoked_deprecated
+        ) or []
     except Exception as e:
         return {
             "found": False,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "objects": [],
             "formatted": "",
             "message": f"Error retrieving objects modified after {timestamp}: {e}",
         }
-
-    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
     if not objects:
         return {
@@ -8983,6 +9022,16 @@ async def generate_layer(
 
     domain = (domain or "enterprise").strip().lower()
     attack_id = (attack_id or "").strip().upper()
+
+    if domain not in DOMAINS:
+        return {
+            "success": False,
+            "attack_id": attack_id,
+            "domain": domain,
+            "count": 0,
+            "layer": None,
+            "message": f"Invalid domain '{domain}'. Must be one of: {', '.join(DOMAINS)}.",
+        }
 
     # Validate ATT&CK ID format: Gxxxx, Mxxxx, Sxxxx, Dxxxx, or DCxxxx (v20.1 data component)
     if not re.match(r"^(?:[GMSD]|DC)\d+$", attack_id):

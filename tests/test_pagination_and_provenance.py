@@ -527,6 +527,114 @@ class TestGroupSoftwareProvenanceAndRegressions(unittest.TestCase):
         self.assertEqual(dc_p1["offset"], 50)
         self.assertTrue(set(t["stix_id"] for t in dc_p0["techniques"]).isdisjoint(t["stix_id"] for t in dc_p1["techniques"]))
 
+    def test_six_live_verification_fixes(self) -> None:
+        # 1. get_group_techniques exact-match-first prevents APT3->APT38 and APT1->APT17 collisions
+        apt3 = asyncio.run(srv.get_group_techniques("APT3", domain="enterprise", include_description=False))
+        self.assertTrue(apt3["found"])
+        self.assertEqual(apt3["group"]["attack_id"], "G0022")
+        self.assertEqual(apt3["group"]["name"], "APT3")
+
+        apt1 = asyncio.run(srv.get_group_techniques("APT1", domain="enterprise", include_description=False))
+        self.assertTrue(apt1["found"])
+        self.assertEqual(apt1["group"]["attack_id"], "G0006")
+        self.assertEqual(apt1["group"]["name"], "APT1")
+
+        # 2. get_objects_by_content, get_objects_created_after, get_objects_modified_after
+        #    exclude revoked/deprecated by default (and allow opting in with remove_revoked_deprecated=False)
+        ps_active = asyncio.run(
+            srv.get_objects_by_content("PowerShell", "attack-pattern", domain="enterprise", include_description=False)
+        )
+        ps_all = asyncio.run(
+            srv.get_objects_by_content(
+                "PowerShell",
+                "attack-pattern",
+                domain="enterprise",
+                include_description=False,
+                remove_revoked_deprecated=False,
+            )
+        )
+        self.assertEqual(ps_active["count"], 47)
+        self.assertEqual(ps_all["count"], 62)
+
+        ca_active = asyncio.run(
+            srv.get_objects_created_after(
+                "2025-01-01T00:00:00.000Z", domain="enterprise", include_description=False, limit=5, offset=0
+            )
+        )
+        ca_all = asyncio.run(
+            srv.get_objects_created_after(
+                "2025-01-01T00:00:00.000Z",
+                domain="enterprise",
+                include_description=False,
+                remove_revoked_deprecated=False,
+                limit=5,
+                offset=0,
+            )
+        )
+        self.assertEqual(ca_active["total_count"], 7087)
+        self.assertEqual(ca_all["total_count"], 7091)
+
+        ma_active = asyncio.run(
+            srv.get_objects_modified_after(
+                "2025-01-01T00:00:00.000Z", domain="enterprise", include_description=False, limit=5, offset=0
+            )
+        )
+        ma_all = asyncio.run(
+            srv.get_objects_modified_after(
+                "2025-01-01T00:00:00.000Z",
+                domain="enterprise",
+                include_description=False,
+                remove_revoked_deprecated=False,
+                limit=5,
+                offset=0,
+            )
+        )
+        self.assertEqual(ma_active["total_count"], 25978)
+        self.assertEqual(ma_all["total_count"], 26423)
+
+        # 3. get_objects_by_name is case-insensitive and filters revoked/deprecated by default
+        phish_lc = asyncio.run(srv.get_objects_by_name("phishing", "attack-pattern", domain="enterprise"))
+        self.assertEqual(phish_lc["count"], 1)
+        self.assertEqual(phish_lc["objects"][0]["attack_id"], "T1566")
+
+        apt29_lc = asyncio.run(srv.get_objects_by_name("apt29", "intrusion-set", domain="enterprise"))
+        self.assertEqual(apt29_lc["count"], 1)
+        self.assertEqual(apt29_lc["objects"][0]["attack_id"], "G0016")
+
+        cs_lc = asyncio.run(srv.get_objects_by_name("cobalt strike", "malware", domain="enterprise"))
+        self.assertEqual(cs_lc["count"], 1)
+        self.assertEqual(cs_lc["objects"][0]["attack_id"], "S0154")
+
+        # 4. get_object_by_attack_id normalizes attack_id to canonical uppercase
+        obj_lc = asyncio.run(
+            srv.get_object_by_attack_id("t1059", "attack-pattern", domain="enterprise", include_description=False)
+        )
+        self.assertTrue(obj_lc["found"])
+        self.assertEqual(obj_lc["object"]["id"], "T1059")
+        self.assertIn("'T1059'", obj_lc["message"])
+
+        # 5. Invalid timestamp errors preserve pagination schema fields
+        bad_ca = asyncio.run(srv.get_objects_created_after("not-a-date", domain="enterprise", limit=10, offset=5))
+        self.assertFalse(bad_ca["found"])
+        self.assertEqual(bad_ca["total_count"], 0)
+        self.assertEqual(bad_ca["offset"], 5)
+        self.assertEqual(bad_ca["limit"], 10)
+        self.assertFalse(bad_ca["has_more"])
+        self.assertIsNone(bad_ca["next_offset"])
+
+        bad_ma = asyncio.run(srv.get_objects_modified_after("not-a-date", domain="enterprise", limit=10, offset=5))
+        self.assertFalse(bad_ma["found"])
+        self.assertEqual(bad_ma["total_count"], 0)
+        self.assertEqual(bad_ma["offset"], 5)
+        self.assertEqual(bad_ma["limit"], 10)
+        self.assertFalse(bad_ma["has_more"])
+        self.assertIsNone(bad_ma["next_offset"])
+
+        # 6. generate_layer validates domain against DOMAINS before path construction
+        bad_dom = asyncio.run(srv.generate_layer("G0016", domain="bogus"))
+        self.assertFalse(bad_dom["success"])
+        self.assertIn("Invalid domain", bad_dom["message"])
+
 
 if __name__ == "__main__":
     unittest.main()
