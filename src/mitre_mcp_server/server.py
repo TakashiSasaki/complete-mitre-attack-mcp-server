@@ -323,6 +323,50 @@ def format_objects(
 mcp = FastMCP("mitre-attack-mcp-server")
 
 
+def _resolve_local_version(base_version: str = "0.1.6") -> str:
+    """Append +local.<short-sha>[.dirty] SemVer build metadata from git."""
+    import subprocess
+
+    repo_dir = Path(__file__).resolve().parents[2]
+    try:
+        sha = subprocess.check_output(
+            ["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        if not sha:
+            return base_version
+        dirty = subprocess.check_output(
+            ["git", "-C", str(repo_dir), "status", "--porcelain"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        suffix = f"+local.{sha}.dirty" if dirty else f"+local.{sha}"
+        return f"{base_version}{suffix}"
+    except Exception:
+        return base_version
+
+
+SERVER_VERSION = _resolve_local_version("0.1.6")
+mcp._mcp_server.version = SERVER_VERSION
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz_route(request):
+    from starlette.responses import JSONResponse
+
+    return JSONResponse(
+        {"status": "ok", "service": "mitre-attack-mcp-server", "version": SERVER_VERSION}
+    )
+
+
+@mcp.custom_route("/mcp", methods=["HEAD"])
+async def mcp_head_route(request):
+    from starlette.responses import Response
+
+    return Response(status_code=200, headers={"Content-Type": "application/json"})
+
+
 @mcp.tool()
 async def get_data_stats() -> Dict[str, Any]:
     """
@@ -8509,10 +8553,19 @@ def main() -> None:
     loaded = load_all_domains()
     print(f"Loaded {len(loaded)} domains: {', '.join(loaded)}", file=sys.stderr)
     
-    print("Server ready!", file=sys.stderr)
-    
-    # Start the MCP server (FastMCP handles stdio / CLI integration)
-    mcp.run()
+    print(f"Server ready! (version={SERVER_VERSION})", file=sys.stderr)
+
+    transport = os.getenv("MCP_TRANSPORT", "stdio").strip().lower()
+    if transport in {"http", "streamable-http", "streamable_http"}:
+        host = os.getenv("HOST", "127.0.0.1")
+        port = int(os.getenv("PORT", "8789"))
+        mcp.settings.host = host
+        mcp.settings.port = port
+        mcp.settings.stateless_http = True
+        print(f"Starting mitre-attack-mcp-server on streamable-http at {host}:{port}", file=sys.stderr)
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
 
 if __name__ == "__main__":
     main()
