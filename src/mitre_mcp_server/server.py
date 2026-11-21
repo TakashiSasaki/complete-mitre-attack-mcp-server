@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import Annotated, List, Tuple, Dict, Any, Optional
 import os
 import sys
 
 from mitreattack import download_stix, release_info
 from mcp.server.fastmcp import FastMCP
 from mitreattack.stix20 import MitreAttackData
+from pydantic import Field
 
 
 
@@ -17,6 +18,57 @@ from mitreattack.stix20 import MitreAttackData
 
 # Domains we support
 DOMAINS: List[str] = ["enterprise", "mobile", "ics"]
+
+DEFAULT_PAGE_LIMIT = 100
+MAX_PAGE_LIMIT = 200
+
+
+def _validate_pagination(limit: int, offset: int) -> Tuple[int, int]:
+    """Validate pagination bounds (offset >= 0, 1 <= limit <= MAX_PAGE_LIMIT)."""
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError(f"Invalid offset {offset!r}: must be a non-negative integer (>= 0).")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > MAX_PAGE_LIMIT:
+        raise ValueError(
+            f"Invalid limit {limit!r}: must be an integer between 1 and {MAX_PAGE_LIMIT}."
+        )
+    return limit, offset
+
+
+def _paginate_items(
+    items: List[Any],
+    limit: int = DEFAULT_PAGE_LIMIT,
+    offset: int = 0,
+) -> Tuple[List[Any], int, int, int, bool, Optional[int]]:
+    """Slice a deterministically ordered list and return (page, total_count, offset, limit, has_more, next_offset)."""
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
+    total_count = len(items)
+    page = items[safe_offset : safe_offset + safe_limit]
+    has_more = (safe_offset + len(page)) < total_count
+    next_offset = (safe_offset + len(page)) if has_more else None
+    return page, total_count, safe_offset, safe_limit, has_more, next_offset
+
+
+def _format_rel_edge(rel: Any, include_description: bool = True) -> Dict[str, Any]:
+    """Serialize a STIX relationship object/dict into a uniform edge dict."""
+    if isinstance(rel, dict):
+        r_id = rel.get("id")
+        r_type = rel.get("relationship_type")
+        r_desc = rel.get("description") if include_description else None
+        r_source = rel.get("source_ref")
+        r_target = rel.get("target_ref")
+    else:
+        r_id = getattr(rel, "id", None)
+        r_type = getattr(rel, "relationship_type", None)
+        r_desc = getattr(rel, "description", None) if include_description else None
+        r_source = getattr(rel, "source_ref", None)
+        r_target = getattr(rel, "target_ref", None)
+    return {
+        "stix_id": r_id,
+        "relationship_type": r_type,
+        "description": r_desc,
+        "source_ref": r_source,
+        "target_ref": r_target,
+    }
 
 APP_NAME = "mitre-mcp-server"
 
@@ -3066,13 +3118,98 @@ async def get_techniques_used_by_group_software(
             "description": g_desc,
         }
 
-    # Call MITRE helper: techniques reachable via group’s software
+    # Traverse Group -> Software -> Technique so both hops' STIX relationships
+    # are preserved as verifiable provenance paths.
     try:
-        rel_entries = attack_data.get_techniques_used_by_group_software(group_stix_id)
+        sw_entries = attack_data.get_software_used_by_group(group_stix_id) or []
     except Exception:
-        rel_entries = []
+        sw_entries = []
 
-    if not rel_entries:
+    tech_by_id: Dict[str, Any] = {}
+    tech_paths: Dict[str, List[Dict[str, Any]]] = {}
+    tech_rels_by_id: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for sw_entry in sw_entries:
+        if isinstance(sw_entry, dict) and "object" in sw_entry:
+            sw_obj = sw_entry.get("object")
+            g2s_rels = sw_entry.get("relationships", []) or []
+        elif hasattr(sw_entry, "object"):
+            sw_obj = getattr(sw_entry, "object", None)
+            g2s_rels = getattr(sw_entry, "relationships", []) or []
+        else:
+            sw_obj = sw_entry
+            g2s_rels = []
+
+        if sw_obj is None:
+            continue
+
+        sw_obj = _unwrap_stix_object(sw_obj)
+        sw_stix_id = _stix_get(sw_obj, "id")
+        if not sw_stix_id:
+            continue
+
+        sw_name = _stix_get(sw_obj, "name")
+        sw_type = _stix_get(sw_obj, "type")
+        try:
+            sw_attack_id = attack_data.get_attack_id(sw_stix_id)
+        except Exception:
+            sw_attack_id = None
+
+        sw_info = {
+            "attack_id": sw_attack_id,
+            "name": sw_name,
+            "stix_id": sw_stix_id,
+            "type": sw_type,
+        }
+
+        try:
+            sw_tech_entries = attack_data.get_techniques_used_by_software(sw_stix_id) or []
+        except Exception:
+            sw_tech_entries = []
+
+        for t_entry in sw_tech_entries:
+            if isinstance(t_entry, dict) and "object" in t_entry:
+                t_obj = t_entry.get("object")
+                s2t_rels = t_entry.get("relationships", []) or []
+            elif hasattr(t_entry, "object"):
+                t_obj = getattr(t_entry, "object", None)
+                s2t_rels = getattr(t_entry, "relationships", []) or []
+            else:
+                t_obj = t_entry
+                s2t_rels = []
+
+            if t_obj is None:
+                continue
+
+            t_obj = _unwrap_stix_object(t_obj)
+            t_stix_id = _stix_get(t_obj, "id")
+            if not t_stix_id:
+                continue
+
+            tech_by_id.setdefault(t_stix_id, t_obj)
+            paths_list = tech_paths.setdefault(t_stix_id, [])
+            rel_map = tech_rels_by_id.setdefault(t_stix_id, {})
+
+            g2s_formatted = [_format_rel_edge(r, include_description=include_description) for r in g2s_rels]
+            s2t_formatted = [_format_rel_edge(r, include_description=include_description) for r in s2t_rels]
+
+            for r_edge in g2s_formatted + s2t_formatted:
+                r_key = r_edge.get("stix_id") or (
+                    f"{r_edge.get('source_ref')}->{r_edge.get('relationship_type')}->{r_edge.get('target_ref')}"
+                )
+                rel_map.setdefault(r_key, r_edge)
+
+            for g2s_edge in g2s_formatted or [None]:
+                for s2t_edge in s2t_formatted or [None]:
+                    paths_list.append(
+                        {
+                            "software": sw_info,
+                            "group_uses_software": g2s_edge,
+                            "software_uses_technique": s2t_edge,
+                        }
+                    )
+
+    if not tech_by_id:
         return {
             "group": group_info,
             "count": 0,
@@ -3087,63 +3224,31 @@ async def get_techniques_used_by_group_software(
     techniques_structured: List[Dict[str, Any]] = []
     technique_objects_for_format: List[Any] = []
 
-    for entry in rel_entries:
-        if isinstance(entry, dict) and "object" in entry:
-            tech_obj = entry.get("object")
-            rels = entry.get("relationships", [])
-        elif hasattr(entry, "object"):
-            tech_obj = getattr(entry, "object", None)
-            rels = getattr(entry, "relationships", [])
-        else:
-            tech_obj = entry
-            rels = []
-
-        if tech_obj is None:
-            continue
-
+    for t_stix_id, tech_obj in sorted(
+        tech_by_id.items(),
+        key=lambda item: (str(_stix_get(item[1], "name") or ""), str(item[0])),
+    ):
         technique_objects_for_format.append(tech_obj)
 
-        # Extract technique info
-        if isinstance(tech_obj, dict):
-            t_name = tech_obj.get("name")
-            t_stix_id = tech_obj.get("id")
-            t_desc = tech_obj.get("description") if include_description else None
-        else:
-            t_name = getattr(tech_obj, "name", None)
-            t_stix_id = getattr(tech_obj, "id", None)
-            t_desc = getattr(tech_obj, "description", None) if include_description else None
-
-        # External ATT&CK ID (TXXXX / TXXXX.YYY)
+        t_name = _stix_get(tech_obj, "name")
+        t_desc = _stix_get(tech_obj, "description") if include_description else None
         try:
             t_attack_id = attack_data.get_attack_id(t_stix_id)
         except Exception:
             t_attack_id = None
 
-        # Relationship metadata
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        paths_sorted = sorted(
+            tech_paths.get(t_stix_id, []),
+            key=lambda p: (
+                str((p.get("software") or {}).get("stix_id") or ""),
+                str((p.get("group_uses_software") or {}).get("stix_id") or ""),
+                str((p.get("software_uses_technique") or {}).get("stix_id") or ""),
+            ),
+        )
+        rels_sorted = [
+            tech_rels_by_id[t_stix_id][k]
+            for k in sorted(tech_rels_by_id.get(t_stix_id, {}).keys())
+        ]
 
         techniques_structured.append(
             {
@@ -3151,7 +3256,8 @@ async def get_techniques_used_by_group_software(
                 "name": t_name,
                 "stix_id": t_stix_id,
                 "description": t_desc,
-                "relationships": relationships_info,
+                "relationships": rels_sorted,
+                "provenance_paths": paths_sorted,
             }
         )
 
@@ -7961,8 +8067,23 @@ async def get_procedure_examples_by_tactic(
     tactic: str,
     domain: str = "enterprise",
     include_description: bool = True,
-    limit: int = 100,
-    offset: int = 0,
+    limit: Annotated[
+        int,
+        Field(
+            default=DEFAULT_PAGE_LIMIT,
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description=f"Maximum number of items to return per page (1-{MAX_PAGE_LIMIT}).",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    offset: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description="Zero-based starting index for pagination (>= 0).",
+        ),
+    ] = 0,
 ) -> Dict[str, Any]:
     """
     Get all procedure examples for techniques in a specific tactic.
@@ -8069,9 +8190,15 @@ async def get_procedure_examples_by_tactic(
             f"No procedure examples found for tactic '{tactic_name_input}' "
             f"in domain '{domain}'."
         )
+        safe_limit, safe_offset = _validate_pagination(limit, offset)
         resp: Dict[str, Any] = {
             "tactic": tactic_info,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "examples": [],
             "formatted": "",
             "message": f"{msg} {legacy['hint']}" if legacy else msg,
@@ -8080,10 +8207,16 @@ async def get_procedure_examples_by_tactic(
             resp["suggested_tactics"] = legacy["suggested_tactics"]
         return resp
 
-    total_count = len(examples)
-    safe_offset = max(0, offset)
-    safe_limit = max(1, min(limit, 500))
-    page_examples = examples[safe_offset : safe_offset + safe_limit]
+    examples.sort(
+        key=lambda r: (
+            str(_stix_get(r, "id") or ""),
+            str(_stix_get(r, "source_ref") or ""),
+            str(_stix_get(r, "target_ref") or ""),
+        )
+    )
+    page_examples, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        examples, limit=limit, offset=offset
+    )
 
     example_entries: list[Dict[str, Any]] = []
 
@@ -8195,8 +8328,23 @@ async def get_objects_by_type(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
-    limit: int = 100,
-    offset: int = 0,
+    limit: Annotated[
+        int,
+        Field(
+            default=DEFAULT_PAGE_LIMIT,
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description=f"Maximum number of items to return per page (1-{MAX_PAGE_LIMIT}).",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    offset: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description="Zero-based starting index for pagination (>= 0).",
+        ),
+    ] = 0,
 ) -> Dict[str, Any]:
     """
     Get all objects of a specific STIX type.
@@ -8252,11 +8400,18 @@ async def get_objects_by_type(
     except Exception:
         objs = []
 
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
+
     if not objs:
         return {
             "stix_type": stix_type,
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "objects": [],
             "formatted": "",
             "message": (
@@ -8265,10 +8420,15 @@ async def get_objects_by_type(
             ),
         }
 
-    total_count = len(objs)
-    safe_offset = max(0, offset)
-    safe_limit = max(1, min(limit, 500))
-    page_objs = objs[safe_offset : safe_offset + safe_limit]
+    objs.sort(
+        key=lambda obj: (
+            str(_stix_get(obj, "id") or ""),
+            str(_stix_get(obj, "name") or ""),
+        )
+    )
+    page_objs, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        objs, limit=limit, offset=offset
+    )
 
     entries: list[dict[str, Any]] = []
     for obj in page_objs:
@@ -8506,8 +8666,23 @@ async def get_objects_created_after(
     timestamp: str,
     domain: str = "enterprise",
     include_description: bool = True,
-    limit: int = 100,
-    offset: int = 0,
+    limit: Annotated[
+        int,
+        Field(
+            default=DEFAULT_PAGE_LIMIT,
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description=f"Maximum number of items to return per page (1-{MAX_PAGE_LIMIT}).",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    offset: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description="Zero-based starting index for pagination (>= 0).",
+        ),
+    ] = 0,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK objects created after a specific timestamp.
@@ -8547,19 +8722,31 @@ async def get_objects_created_after(
             "message": f"Error retrieving objects created after {timestamp}: {e}",
         }
 
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
+
     if not objects:
         return {
             "found": False,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "objects": [],
             "formatted": "",
             "message": f"No objects created after '{timestamp}' in domain '{domain}'.",
         }
 
-    total_count = len(objects)
-    safe_offset = max(0, offset)
-    safe_limit = max(1, min(limit, 500))
-    page_objects = objects[safe_offset : safe_offset + safe_limit]
+    objects.sort(
+        key=lambda item: (
+            str(_stix_get(_unwrap_stix_object(item), "created") or ""),
+            str(_stix_get(_unwrap_stix_object(item), "id") or ""),
+        )
+    )
+    page_objects, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        objects, limit=limit, offset=offset
+    )
 
     # Build structured response
     results = []
@@ -8607,8 +8794,23 @@ async def get_objects_modified_after(
     timestamp: str,
     domain: str = "enterprise",
     include_description: bool = True,
-    limit: int = 100,
-    offset: int = 0,
+    limit: Annotated[
+        int,
+        Field(
+            default=DEFAULT_PAGE_LIMIT,
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description=f"Maximum number of items to return per page (1-{MAX_PAGE_LIMIT}).",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    offset: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description="Zero-based starting index for pagination (>= 0).",
+        ),
+    ] = 0,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK objects modified after a specific timestamp.
@@ -8648,19 +8850,31 @@ async def get_objects_modified_after(
             "message": f"Error retrieving objects modified after {timestamp}: {e}",
         }
 
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
+
     if not objects:
         return {
             "found": False,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "objects": [],
             "formatted": "",
             "message": f"No objects modified after '{timestamp}' in domain '{domain}'.",
         }
 
-    total_count = len(objects)
-    safe_offset = max(0, offset)
-    safe_limit = max(1, min(limit, 500))
-    page_objects = objects[safe_offset : safe_offset + safe_limit]
+    objects.sort(
+        key=lambda item: (
+            str(_stix_get(_unwrap_stix_object(item), "modified") or ""),
+            str(_stix_get(_unwrap_stix_object(item), "id") or ""),
+        )
+    )
+    page_objects, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        objects, limit=limit, offset=offset
+    )
 
     # Build structured response
     results: list[Dict[str, Any]] = []
@@ -9149,13 +9363,29 @@ async def get_detection_strategies_for_technique(
 async def get_analytics(
     domain: str = "enterprise",
     query: str = "",
-    limit: int = 100,
-    offset: int = 0,
+    limit: Annotated[
+        int,
+        Field(
+            default=DEFAULT_PAGE_LIMIT,
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description=f"Maximum number of items to return per page (1-{MAX_PAGE_LIMIT}).",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    offset: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description="Zero-based starting index for pagination (>= 0).",
+        ),
+    ] = 0,
     include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Search or list ATT&CK v20.1 analytics (x-mitre-analytic / ANxxxx) with pagination.
     """
+    _validate_pagination(limit, offset)
     ad = get_attack_data(domain)
     v20_idx = _get_v20_detection_index(domain)
     q = (query or "").strip().lower()
@@ -9168,10 +9398,10 @@ async def get_analytics(
             continue
         matched.append((an_id, an_obj))
 
-    total_count = len(matched)
-    safe_offset = max(0, offset)
-    safe_limit = max(1, min(limit, 500))
-    page = matched[safe_offset : safe_offset + safe_limit]
+    matched.sort(key=lambda pair: str(pair[0] or ""))
+    page, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        matched, limit=limit, offset=offset
+    )
 
     items = []
     for an_id, an_obj in page:
