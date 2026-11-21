@@ -290,7 +290,8 @@ def _compute_data_stats() -> Dict[str, Any]:
             file_size_mb = stix_path.stat().st_size / (1024 * 1024)
             stats[domain] = {
                 "exists": True,
-                "path": str(stix_path),
+                "path": f"v{release_info.LATEST_VERSION}/{stix_path.name}",
+                "filename": stix_path.name,
                 "size_mb": round(file_size_mb, 2),
                 "version": release_info.LATEST_VERSION,
             }
@@ -298,6 +299,7 @@ def _compute_data_stats() -> Dict[str, Any]:
             stats[domain] = {
                 "exists": False,
                 "path": None,
+                "filename": None,
                 "size_mb": 0.0,
                 "version": None,
             }
@@ -525,7 +527,7 @@ def format_objects(
             lines.append(f"Source Reference: {source_ref}")
 
         # Aliases -----------------------------------------------------------
-        aliases = _stix_get(obj, "aliases")
+        aliases = _stix_get(obj, "aliases") or _stix_get(obj, "x_mitre_aliases")
         if aliases:
             lines.append(f"Aliases: {aliases}")
 
@@ -1123,6 +1125,18 @@ async def get_techniques_by_tactic(
     attack_data = get_attack_data(domain)
 
     tactic_shortname = _normalize_tactic_shortname(attack_data, tactic)
+    canonical_tactic = tactic
+    try:
+        for t_obj in attack_data.get_tactics(remove_revoked_deprecated=True) or []:
+            t_short = (_stix_get(t_obj, "x_mitre_shortname", "") or "").strip()
+            t_name = (_stix_get(t_obj, "name", "") or "").strip()
+            if t_short.lower() == tactic_shortname.lower() or t_name.lower() == (tactic or "").strip().lower():
+                if t_name:
+                    canonical_tactic = t_name
+                break
+    except Exception:
+        pass
+
     try:
         techniques = attack_data.get_techniques_by_tactic(
             tactic_shortname,
@@ -1134,7 +1148,7 @@ async def get_techniques_by_tactic(
 
     if not techniques:
         legacy = _LEGACY_TACTIC_MIGRATIONS.get((tactic or "").strip().lower())
-        msg = f"No techniques found for tactic '{tactic}' in domain '{domain}'."
+        msg = f"No techniques found for tactic '{canonical_tactic}' in domain '{domain}'."
         resp: Dict[str, Any] = {
             "count": 0,
             "techniques": [],
@@ -1172,7 +1186,7 @@ async def get_techniques_by_tactic(
                 "name": name,
                 "stix_id": stix_id,
                 "description": description,
-                "tactic": tactic,
+                "tactic": canonical_tactic,
             }
         )
 
@@ -1187,7 +1201,7 @@ async def get_techniques_by_tactic(
         "techniques": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} technique(s) for tactic '{tactic}' "
+            f"Found {len(structured)} technique(s) for tactic '{canonical_tactic}' "
             f"in domain '{domain}'."
         ),
     }
@@ -1765,30 +1779,7 @@ async def get_group_techniques(
             t_attack_id = None
 
         # Compact relationship info
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         techniques_structured.append(
             {
@@ -2198,10 +2189,11 @@ async def get_technique_tactics(
         }
     """
     attack_data = get_attack_data(domain)
+    norm_id = (technique_id or "").strip().upper()
 
     # 1) Look up the technique by ATT&CK ID
     try:
-        tech = attack_data.get_object_by_attack_id(technique_id, "attack-pattern")
+        tech = attack_data.get_object_by_attack_id(norm_id, "attack-pattern")
     except Exception:
         tech = None
 
@@ -2211,7 +2203,7 @@ async def get_technique_tactics(
             "technique": None,
             "tactics": [],
             "message": (
-                f"Technique '{technique_id}' not found in domain '{domain}'."
+                f"Technique '{norm_id}' not found in domain '{domain}'."
             ),
         }
 
@@ -2224,6 +2216,13 @@ async def get_technique_tactics(
         tech_name = getattr(tech, "name", None)
         tech_stix_id = getattr(tech, "id", None)
         phases = getattr(tech, "kill_chain_phases", []) or []
+
+    canonical_id = norm_id
+    if tech_stix_id:
+        try:
+            canonical_id = attack_data.get_attack_id(tech_stix_id) or norm_id
+        except Exception:
+            canonical_id = norm_id
 
     # 3) Normalize phases into tactic objects
     tactics: List[Dict[str, Any]] = []
@@ -2252,13 +2251,13 @@ async def get_technique_tactics(
     return {
         "found": True,
         "technique": {
-            "id": technique_id,
+            "id": canonical_id,
             "name": tech_name,
             "stix_id": tech_stix_id,
         },
         "tactics": tactics,
         "message": (
-            f"Found {len(tactics)} tactic phase(s) for technique '{technique_id}' "
+            f"Found {len(tactics)} tactic phase(s) for technique '{canonical_id}' "
             f"in domain '{domain}'."
         ),
     }
@@ -2289,7 +2288,8 @@ async def get_stats(
           "message": "<status message>"
         }
     """
-    attack_data = get_attack_data(domain)
+    domain_norm = (domain or "enterprise").strip().lower()
+    attack_data = get_attack_data(domain_norm)
 
     def safe_count(getter) -> int:
         try:
@@ -2306,10 +2306,10 @@ async def get_stats(
     }
 
     return {
-        "domain": domain,
+        "domain": domain_norm,
         "stats": stats,
         "message": (
-            f"ATT&CK object statistics for domain '{domain}': "
+            f"ATT&CK object statistics for domain '{domain_norm}': "
             f"{stats['techniques']} techniques, "
             f"{stats['groups']} groups, "
             f"{stats['software']} software, "
@@ -2565,30 +2565,7 @@ async def get_techniques_used_by_group(
             t_attack_id = None
 
         # Relationship info
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         techniques_structured.append(
             {
@@ -2751,30 +2728,7 @@ async def get_software_used_by_group(
         except Exception:
             s_attack_id = None
 
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         software_structured.append(
             {
@@ -2910,6 +2864,7 @@ async def get_campaigns_attributed_to_group(
             continue
         name = _stix_get(c, "name")
         stix_id = _stix_get(c, "id")
+        aliases = _stix_get(c, "aliases") or _stix_get(c, "x_mitre_aliases") or []
         desc = _stix_get(c, "description") if include_description else None
 
         campaign_objects_for_format.append(c)
@@ -2923,6 +2878,7 @@ async def get_campaigns_attributed_to_group(
             {
                 "attack_id": attack_id,
                 "name": name,
+                "aliases": aliases,
                 "stix_id": stix_id,
                 "description": desc,
             }
@@ -2987,6 +2943,21 @@ async def get_campaigns_by_alias(
     except Exception:
         campaigns = []
 
+    if not campaigns and alias:
+        alias_norm = alias.strip().lower()
+        try:
+            all_campaigns = attack_data.get_campaigns(remove_revoked_deprecated=True) or []
+            campaigns = [
+                c for c in all_campaigns
+                if alias_norm == (_stix_get(c, "name", "") or "").lower()
+                or any(
+                    alias_norm == (a or "").lower()
+                    for a in (_stix_get(c, "aliases") or _stix_get(c, "x_mitre_aliases") or [])
+                )
+            ]
+        except Exception:
+            campaigns = []
+
     if not campaigns:
         return {
             "alias": alias,
@@ -2999,19 +2970,21 @@ async def get_campaigns_by_alias(
     # Build structured campaign entries
     campaign_entries = []
     for c in campaigns:
-        name = getattr(c, "name", None)
-        stix_id = getattr(c, "id", None)
+        name = _stix_get(c, "name")
+        stix_id = _stix_get(c, "id")
+        aliases = _stix_get(c, "aliases") or _stix_get(c, "x_mitre_aliases") or []
 
         try:
             attack_id = attack_data.get_attack_id(stix_id)
         except Exception:
             attack_id = None
 
-        description = getattr(c, "description", None) if include_description else None
+        description = _stix_get(c, "description") if include_description else None
 
         campaign_entries.append(
             {
                 "name": name,
+                "aliases": aliases,
                 "stix_id": stix_id,
                 "attack_id": attack_id,
                 "description": description,
@@ -3475,30 +3448,7 @@ async def get_groups_using_technique(
         except Exception:
             g_attack_id = None
 
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         groups_structured.append(
             {
@@ -3670,30 +3620,7 @@ async def get_groups_using_software(
         except Exception:
             g_attack_id = None
 
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         groups_structured.append(
             {
@@ -3861,30 +3788,7 @@ async def get_groups_attributing_to_campaign(
         except Exception:
             g_attack_id = None
 
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         groups_structured.append(
             {
@@ -3959,9 +3863,24 @@ async def get_software_by_alias(
 
     # Query the underlying library
     try:
-        results = attack_data.get_software_by_alias(alias)
+        results = attack_data.get_software_by_alias(alias) or []
     except Exception:
         results = []
+
+    if not results and alias:
+        alias_norm = alias.strip().lower()
+        try:
+            all_sw = attack_data.get_software(remove_revoked_deprecated=True) or []
+            results = [
+                sw for sw in all_sw
+                if alias_norm == (_stix_get(sw, "name", "") or "").lower()
+                or any(
+                    alias_norm == (a or "").lower()
+                    for a in (_stix_get(sw, "x_mitre_aliases") or _stix_get(sw, "aliases") or [])
+                )
+            ]
+        except Exception:
+            results = []
 
     if not results:
         return {
@@ -3983,13 +3902,13 @@ async def get_software_by_alias(
         if isinstance(sw, dict):
             s_name = sw.get("name")
             s_stix_id = sw.get("id")
-            s_aliases = sw.get("aliases", [])
+            s_aliases = sw.get("x_mitre_aliases") or sw.get("aliases") or []
             s_type = sw.get("type")
             s_desc = sw.get("description") if include_description else None
         else:
             s_name = getattr(sw, "name", None)
             s_stix_id = getattr(sw, "id", None)
-            s_aliases = getattr(sw, "aliases", [])
+            s_aliases = getattr(sw, "x_mitre_aliases", None) or getattr(sw, "aliases", None) or []
             s_type = getattr(sw, "type", None)
             s_desc = getattr(sw, "description", None) if include_description else None
 
@@ -4171,30 +4090,7 @@ async def get_software_using_technique(
             s_attack_id = None
 
         # Relationship metadata (if present)
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         software_structured.append(
             {
@@ -4364,30 +4260,7 @@ async def get_techniques_used_by_software(
             t_attack_id = None
 
         # Relationship metadata
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         techniques_structured.append(
             {
@@ -5455,10 +5328,12 @@ async def get_all_campaigns(
         if isinstance(c, dict):
             name = c.get("name")
             stix_id = c.get("id")
+            aliases = c.get("aliases") or c.get("x_mitre_aliases") or []
             description = c.get("description") if include_description else None
         else:
             name = getattr(c, "name", None)
             stix_id = getattr(c, "id", None)
+            aliases = getattr(c, "aliases", None) or getattr(c, "x_mitre_aliases", None) or []
             description = getattr(c, "description", None) if include_description else None
 
         # Lookup ATT&CK ID (sometimes campaigns do have Cxxxx IDs)
@@ -5471,6 +5346,7 @@ async def get_all_campaigns(
             {
                 "attack_id": attack_id,
                 "name": name,
+                "aliases": aliases,
                 "stix_id": stix_id,
                 "description": description,
             }
@@ -5545,15 +5421,23 @@ async def get_all_datasources(
         }
 
     if not datasources:
+        msg = (
+            f"No data sources found in domain '{domain}' "
+            f"(remove_revoked_deprecated={remove_revoked_deprecated})."
+        )
+        if remove_revoked_deprecated:
+            msg += (
+                " Note: In ATT&CK v20.1, x-mitre-data-source objects are deprecated in favor of "
+                "Detection Strategies and Analytics. Use get_detection_strategies_for_technique, "
+                "get_analytics, or get_all_datacomponents instead, or pass "
+                "remove_revoked_deprecated=False to inspect legacy data sources."
+            )
         return {
             "domain": domain,
             "count": 0,
             "datasources": [],
             "formatted": "",
-            "message": (
-                f"No data sources found in domain '{domain}' "
-                f"(remove_revoked_deprecated={remove_revoked_deprecated})."
-            ),
+            "message": msg,
         }
 
     structured: List[Dict[str, Any]] = []
@@ -6057,6 +5941,7 @@ async def get_techniques_targeting_asset(
             attack_id = None
         out.append(
             {
+                "attack_id": attack_id,
                 "id": attack_id,
                 "name": _stix_get(tech, "name"),
                 "stix_id": stix_id,
@@ -6200,10 +6085,12 @@ async def get_campaigns_using_technique(
         if isinstance(camp_obj, dict):
             c_name = camp_obj.get("name")
             c_stix_id = camp_obj.get("id")
+            c_aliases = camp_obj.get("aliases") or camp_obj.get("x_mitre_aliases") or []
             c_desc = camp_obj.get("description") if include_description else None
         else:
             c_name = getattr(camp_obj, "name", None)
             c_stix_id = getattr(camp_obj, "id", None)
+            c_aliases = getattr(camp_obj, "aliases", None) or getattr(camp_obj, "x_mitre_aliases", None) or []
             c_desc = getattr(camp_obj, "description", None) if include_description else None
 
         # External ATT&CK campaign ID (CXXXX)
@@ -6213,35 +6100,13 @@ async def get_campaigns_using_technique(
             c_attack_id = None
 
         # Relationship metadata (if available)
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         campaigns_structured.append(
             {
                 "attack_id": c_attack_id,
                 "name": c_name,
+                "aliases": c_aliases,
                 "stix_id": c_stix_id,
                 "description": c_desc,
                 "relationships": relationships_info,
@@ -6412,30 +6277,7 @@ async def get_techniques_used_by_campaign(
                 tactics.append(phase_name.replace("-", " ").title())
 
         # Relationship metadata
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         techniques_structured.append(
             {
@@ -6591,10 +6433,12 @@ async def get_campaigns_using_software(
         if isinstance(camp_obj, dict):
             c_name = camp_obj.get("name")
             c_stix_id = camp_obj.get("id")
+            c_aliases = camp_obj.get("aliases") or camp_obj.get("x_mitre_aliases") or []
             c_desc = camp_obj.get("description") if include_description else None
         else:
             c_name = getattr(camp_obj, "name", None)
             c_stix_id = getattr(camp_obj, "id", None)
+            c_aliases = getattr(camp_obj, "aliases", None) or getattr(camp_obj, "x_mitre_aliases", None) or []
             c_desc = getattr(camp_obj, "description", None) if include_description else None
 
         # External ATT&CK campaign ID (CXXXX)
@@ -6604,35 +6448,13 @@ async def get_campaigns_using_software(
             c_attack_id = None
 
         # Relationship metadata
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         campaigns_structured.append(
             {
                 "attack_id": c_attack_id,
                 "name": c_name,
+                "aliases": c_aliases,
                 "stix_id": c_stix_id,
                 "description": c_desc,
                 "relationships": relationships_info,
@@ -6795,30 +6617,7 @@ async def get_software_used_by_campaign(
             s_attack_id = None
 
         # Relationship metadata
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         software_structured.append(
             {
@@ -6862,6 +6661,23 @@ async def get_techniques_by_platform(
     domain: str = "enterprise",
     include_description: bool = True,
     remove_revoked_deprecated: bool = True,
+    limit: Annotated[
+        int,
+        Field(
+            default=DEFAULT_PAGE_LIMIT,
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description=f"Maximum number of items to return per page (1-{MAX_PAGE_LIMIT}).",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    offset: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description="Zero-based starting index for pagination (>= 0).",
+        ),
+    ] = 0,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK techniques that apply to a specific platform.
@@ -6930,19 +6746,36 @@ async def get_techniques_by_platform(
         techniques = []
 
     if not techniques:
+        safe_limit, safe_offset = _validate_pagination(limit, offset)
         return {
-            "platform": platform,
+            "platform": canonical_platform,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": (
-                f"No techniques found for platform '{platform}' "
+                f"No techniques found for platform '{canonical_platform}' "
                 f"in domain '{domain}'."
             ),
         }
 
+    techniques_sorted = sorted(
+        techniques,
+        key=lambda t: (
+            str(_stix_get(t, "name") or ""),
+            str(_stix_get(t, "id") or ""),
+        ),
+    )
+    page_techniques, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        techniques_sorted, limit=limit, offset=offset
+    )
+
     structured = []
-    for tech in techniques:
+    for tech in page_techniques:
         if isinstance(tech, dict):
             t_name = tech.get("name")
             t_stix = tech.get("id")
@@ -6969,19 +6802,25 @@ async def get_techniques_by_platform(
 
     # optional human-readable formatting
     formatted = format_objects(
-        techniques,
+        page_techniques,
         include_description=include_description,
         domain=domain,
     )
 
     return {
-        "platform": platform,
+        "platform": canonical_platform,
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "techniques": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} technique(s) applicable to platform "
-            f"'{platform}' in domain '{domain}'."
+            f"Found {total_count} technique(s) applicable to platform "
+            f"'{canonical_platform}' in domain '{domain}' "
+            f"(returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -7474,10 +7313,6 @@ async def get_mitigations_mitigating_technique(
             f"technique '{technique_info.get('attack_id')}' "
             f"({technique_info.get('name')})."
         ),
-        "debug": {
-            "raw_relationship_entries": len(rel_entries),
-            "unwrapped_mitigations": len(mitigation_objects),
-        },
     }
 
 
@@ -7785,6 +7620,23 @@ async def get_techniques_detected_by_datacomponent(
     datacomponent_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    limit: Annotated[
+        int,
+        Field(
+            default=DEFAULT_PAGE_LIMIT,
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description=f"Maximum number of items to return per page (1-{MAX_PAGE_LIMIT}).",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    offset: Annotated[
+        int,
+        Field(
+            default=0,
+            ge=0,
+            description="Zero-based starting index for pagination (>= 0).",
+        ),
+    ] = 0,
 ) -> Dict[str, Any]:
     """
     Get all techniques that can be detected by a specific data component.
@@ -7909,9 +7761,15 @@ async def get_techniques_detected_by_datacomponent(
                 continue
 
     if not techniques:
+        safe_limit, safe_offset = _validate_pagination(limit, offset)
         return {
             "datacomponent": datacomponent_info,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": (
@@ -7920,9 +7778,20 @@ async def get_techniques_detected_by_datacomponent(
             ),
         }
 
+    techniques_sorted = sorted(
+        techniques,
+        key=lambda t: (
+            str(_stix_get(t, "name") or ""),
+            str(_stix_get(t, "id") or ""),
+        ),
+    )
+    page_techniques, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        techniques_sorted, limit=limit, offset=offset
+    )
+
     # --- Let's build structured list of techniques ---
     technique_entries: List[Dict[str, Any]] = []
-    for t in techniques:
+    for t in page_techniques:
         if isinstance(t, dict):
             t_name = t.get("name")
             t_stix = t.get("id")
@@ -7948,9 +7817,9 @@ async def get_techniques_detected_by_datacomponent(
 
     # --- Optional human-readable formatted output. Can be silent if needed ---
     formatted = ""
-    if techniques:
+    if page_techniques:
         formatted = format_objects(
-            techniques,
+            page_techniques,
             include_description=include_description,
             domain=domain,
         )
@@ -7958,11 +7827,17 @@ async def get_techniques_detected_by_datacomponent(
     return {
         "datacomponent": datacomponent_info,
         "count": len(technique_entries),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "techniques": technique_entries,
         "formatted": formatted,
         "message": (
-            f"Found {len(technique_entries)} technique(s) that can be detected by "
-            f"data component STIX ID '{datacomponent_stix_id}' in domain '{domain}'."
+            f"Found {total_count} technique(s) that can be detected by "
+            f"data component STIX ID '{datacomponent_stix_id}' in domain '{domain}' "
+            f"(returning {len(technique_entries)} at offset {safe_offset})."
         ),
     }
 
@@ -8113,8 +7988,8 @@ async def get_procedure_examples_by_technique(
         "examples": example_entries,
         "formatted": formatted,
         "message": (
-            f"Found {len(example_entries)} procedure examples showing how groups "
-            f"used technique '{tech_attack_id}' ({tech_name})."
+            f"Found {len(example_entries)} procedure examples for "
+            f"technique '{tech_attack_id}' ({tech_name})."
         ),
     }
 
@@ -8351,11 +8226,21 @@ async def get_procedure_examples_by_tactic(
         )
 
     # --- Human-readable formatted block (for LLMs / humans) ---
-    formatted = format_objects(
-        page_examples,
-        include_description=include_description,
-        domain=domain,
-    )
+    fmt_lines = []
+    for e in example_entries:
+        s = e["source"]
+        t = e["technique"]
+        src_label = f"[{s.get('type') or 'unknown'}] {s.get('name') or s.get('stix_id')}"
+        if s.get("attack_id"):
+            src_label += f" ({s['attack_id']})"
+        tech_label = t.get("name") or t.get("stix_id") or "unknown"
+        if t.get("attack_id"):
+            tech_label += f" ({t['attack_id']})"
+        line = f"- {src_label} -> {tech_label}"
+        if include_description and e.get("description"):
+            line += f": {e['description']}"
+        fmt_lines.append(line)
+    formatted = "\n".join(fmt_lines)
     has_more = (safe_offset + len(example_entries)) < total_count
 
     return {

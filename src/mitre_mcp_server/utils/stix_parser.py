@@ -872,10 +872,30 @@ class MITREDataManager:
         attack_data = self.get_attack_data(domain)
         
         try:
-            software = attack_data.get_software_by_alias(alias)
-            return software if software else []
+            software = attack_data.get_software_by_alias(alias) or []
         except Exception:
-            return []
+            software = []
+        if not software and alias:
+            alias_norm = alias.strip().lower()
+            try:
+                all_sw = attack_data.get_software(remove_revoked_deprecated=True) or []
+                software = [
+                    sw for sw in all_sw
+                    if alias_norm == (getattr(sw, "name", None) or (sw.get("name") if isinstance(sw, dict) else "") or "").lower()
+                    or any(
+                        alias_norm == (a or "").lower()
+                        for a in (
+                            getattr(sw, "x_mitre_aliases", None)
+                            or getattr(sw, "aliases", None)
+                            or (sw.get("x_mitre_aliases") if isinstance(sw, dict) else None)
+                            or (sw.get("aliases") if isinstance(sw, dict) else None)
+                            or []
+                        )
+                    )
+                ]
+            except Exception:
+                software = []
+        return software
 
 
     def get_software_using_technique(
@@ -1691,10 +1711,30 @@ class MITREDataManager:
         attack_data = self.get_attack_data(domain)
         
         try:
-            campaigns = attack_data.get_campaigns_by_alias(alias)
-            return campaigns if campaigns else []
+            campaigns = attack_data.get_campaigns_by_alias(alias) or []
         except Exception:
-            return []
+            campaigns = []
+        if not campaigns and alias:
+            alias_norm = alias.strip().lower()
+            try:
+                all_campaigns = attack_data.get_campaigns(remove_revoked_deprecated=True) or []
+                campaigns = [
+                    c for c in all_campaigns
+                    if alias_norm == (getattr(c, "name", None) or (c.get("name") if isinstance(c, dict) else "") or "").lower()
+                    or any(
+                        alias_norm == (a or "").lower()
+                        for a in (
+                            getattr(c, "aliases", None)
+                            or getattr(c, "x_mitre_aliases", None)
+                            or (c.get("aliases") if isinstance(c, dict) else None)
+                            or (c.get("x_mitre_aliases") if isinstance(c, dict) else None)
+                            or []
+                        )
+                    )
+                ]
+            except Exception:
+                campaigns = []
+        return campaigns
 
     def get_objects_by_type(
         self,

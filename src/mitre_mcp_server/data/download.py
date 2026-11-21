@@ -170,7 +170,8 @@ def get_data_stats() -> dict:
             file_size_mb = stix_path.stat().st_size / (1024 * 1024)
             stats[domain] = {
                 "exists": True,
-                "path": str(stix_path),
+                "path": f"v{release_info.LATEST_VERSION}/{stix_path.name}",
+                "filename": stix_path.name,
                 "size_mb": round(file_size_mb, 2),
                 "version": release_info.LATEST_VERSION
             }
@@ -178,6 +179,7 @@ def get_data_stats() -> dict:
             stats[domain] = {
                 "exists": False,
                 "path": None,
+                "filename": None,
                 "size_mb": 0,
                 "version": None
             }

@@ -16,6 +16,8 @@ class TestPaginationContractsAndSchemas(unittest.TestCase):
         "get_objects_created_after",
         "get_procedure_examples_by_tactic",
         "get_analytics",
+        "get_techniques_by_platform",
+        "get_techniques_detected_by_datacomponent",
     )
 
     def test_mcp_input_schemas_expose_limit_and_offset(self) -> None:
@@ -235,6 +237,15 @@ class TestPaginationContractsAndSchemas(unittest.TestCase):
                 asyncio.run(srv.get_procedure_examples_by_tactic("Execution", **kwargs))
             with self.assertRaises(ValueError):
                 asyncio.run(srv.get_analytics(**kwargs))
+            with self.assertRaises(ValueError):
+                asyncio.run(srv.get_techniques_by_platform("Windows", **kwargs))
+            with self.assertRaises(ValueError):
+                asyncio.run(
+                    srv.get_techniques_detected_by_datacomponent(
+                        "x-mitre-data-component--02d090b6-8157-48da-98a2-517f7edd49fc",
+                        **kwargs,
+                    )
+                )
 
     def test_max_page_limit_stays_under_1mb_ceiling(self) -> None:
         res = asyncio.run(
@@ -370,13 +381,18 @@ class TestGroupSoftwareProvenanceAndRegressions(unittest.TestCase):
         nonexistent = asyncio.run(srv.get_stix_type("attack-pattern--00000000-0000-0000-0000-000000000000"))
         self.assertFalse(nonexistent["found"])
 
-        # 7. get_techniques_by_platform counts
+        # 7. get_techniques_by_platform counts (paginated)
         win_ent = asyncio.run(srv.get_techniques_by_platform("Windows", domain="enterprise", include_description=False))
         and_mob = asyncio.run(srv.get_techniques_by_platform("Android", domain="mobile", include_description=False))
         win_ics = asyncio.run(srv.get_techniques_by_platform("Windows", domain="ics", include_description=False))
-        self.assertEqual(win_ent["count"], 479)
-        self.assertEqual(and_mob["count"], 123)
+        self.assertEqual(win_ent["total_count"], 479)
+        self.assertEqual(win_ent["count"], 100)
+        self.assertTrue(win_ent["has_more"])
+        self.assertEqual(win_ent["next_offset"], 100)
+        self.assertEqual(and_mob["total_count"], 123)
+        self.assertEqual(win_ics["total_count"], 69)
         self.assertEqual(win_ics["count"], 69)
+        self.assertFalse(win_ics["has_more"])
 
         # 8. T1059.001 detection and DC0084
         t1059_001 = srv.get_datacomponents_detecting_technique(
@@ -394,6 +410,122 @@ class TestGroupSoftwareProvenanceAndRegressions(unittest.TestCase):
             )
         )
         self.assertEqual(dc0084_techs["count"], 9)
+        self.assertEqual(dc0084_techs["total_count"], 9)
+        self.assertFalse(dc0084_techs["has_more"])
+
+    def test_nine_v20_1_fixes(self) -> None:
+        # 1. Case-insensitive alias lookup & software aliases populated
+        camp_ci = asyncio.run(srv.get_campaigns_by_alias("operation north star", domain="enterprise", include_description=False))
+        self.assertEqual(camp_ci["count"], 1)
+        self.assertEqual(camp_ci["campaigns"][0]["attack_id"], "C0022")
+        self.assertIn("Operation North Star", camp_ci["campaigns"][0]["aliases"])
+
+        sw_ci = asyncio.run(srv.get_software_by_alias("cobalt strike", domain="enterprise", include_description=False))
+        self.assertEqual(sw_ci["count"], 1)
+        self.assertEqual(sw_ci["software"][0]["attack_id"], "S0154")
+        self.assertTrue(sw_ci["software"][0]["aliases"])
+        self.assertIn("Cobalt Strike", sw_ci["software"][0]["aliases"])
+
+        # 2. Campaign aliases in structured JSON
+        all_camps = asyncio.run(srv.get_all_campaigns(domain="enterprise", include_description=False))
+        self.assertGreater(all_camps["count"], 0)
+        self.assertTrue(all("aliases" in c for c in all_camps["campaigns"]))
+
+        # 3. No debug block in mitigations & no internal path leakage in data stats
+        mits = asyncio.run(
+            srv.get_mitigations_mitigating_technique(
+                technique_stix_id="attack-pattern--43e7dc91-05b2-474c-b9ac-2ed4fe101f4d",
+                domain="enterprise",
+                include_description=False,
+            )
+        )
+        self.assertNotIn("debug", mits)
+
+        dstats = asyncio.run(srv.get_data_stats())
+        for dom_info in dstats.values():
+            if dom_info.get("exists"):
+                self.assertNotIn("/data/", dom_info["path"])
+                self.assertTrue(dom_info["filename"].endswith(".json"))
+
+        # 4. Procedure examples formatting & message wording
+        proc_tactic = asyncio.run(
+            srv.get_procedure_examples_by_tactic("Stealth", domain="enterprise", include_description=False, limit=5, offset=0)
+        )
+        self.assertEqual(proc_tactic["count"], 5)
+        self.assertNotIn("STIX ID: relationship--", proc_tactic["formatted"])
+        self.assertNotIn("Source Reference:", proc_tactic["formatted"])
+        self.assertIn("->", proc_tactic["formatted"])
+
+        proc_tech = asyncio.run(
+            srv.get_procedure_examples_by_technique(
+                technique_stix_id="attack-pattern--43e7dc91-05b2-474c-b9ac-2ed4fe101f4d",
+                domain="enterprise",
+                include_description=False,
+            )
+        )
+        self.assertNotIn("showing how groups used", proc_tech["message"])
+
+        # 5. get_all_datasources v20.1 deprecation guidance
+        ds = asyncio.run(srv.get_all_datasources(domain="enterprise", remove_revoked_deprecated=True))
+        self.assertEqual(ds["count"], 0)
+        self.assertIn("get_detection_strategies_for_technique", ds["message"])
+        self.assertIn("remove_revoked_deprecated=False", ds["message"])
+
+        # 6. Canonical normalization of echoed inputs
+        tt = asyncio.run(srv.get_technique_tactics("t1055", domain="enterprise"))
+        self.assertEqual(tt["technique"]["id"], "T1055")
+        self.assertIn("'T1055'", tt["message"])
+
+        st = asyncio.run(srv.get_stats(domain="Enterprise"))
+        self.assertEqual(st["domain"], "enterprise")
+
+        tp = asyncio.run(srv.get_techniques_by_platform("windows", domain="enterprise", include_description=False, limit=10, offset=0))
+        self.assertEqual(tp["platform"], "Windows")
+        self.assertEqual(tp["count"], 10)
+        self.assertEqual(tp["total_count"], 479)
+        self.assertTrue(tp["has_more"])
+        self.assertEqual(tp["next_offset"], 10)
+
+        ttac = asyncio.run(srv.get_techniques_by_tactic("stealth", domain="enterprise", include_description=False))
+        self.assertGreater(ttac["count"], 0)
+        self.assertEqual(ttac["techniques"][0]["tactic"], "Stealth")
+
+        # 7. include_description=False respected in nested relationships[].description
+        gt = asyncio.run(srv.get_group_techniques("APT29", domain="enterprise", include_description=False))
+        self.assertGreater(gt["count"], 0)
+        for tech in gt["techniques"]:
+            self.assertIsNone(tech["description"])
+            for rel in tech["relationships"]:
+                self.assertIsNone(rel["description"])
+
+        # 8. get_techniques_targeting_asset includes attack_id
+        assets = asyncio.run(srv.get_all_assets(domain="ics", include_description=False))
+        self.assertGreater(assets["count"], 0)
+        asset_techs = asyncio.run(
+            srv.get_techniques_targeting_asset(assets["assets"][0]["stix_id"], domain="ics", include_description=False)
+        )
+        self.assertGreater(asset_techs["count"], 0)
+        self.assertTrue(all("attack_id" in t and t["attack_id"] for t in asset_techs["techniques"]))
+
+        # 9. Pagination on get_techniques_detected_by_datacomponent (DC0032 Process Creation has >100 techs)
+        dcs = asyncio.run(srv.get_all_datacomponents(domain="enterprise", include_description=False))
+        dc0032 = next(d for d in dcs["datacomponents"] if d.get("attack_id") == "DC0032")
+        dc_p0 = asyncio.run(
+            srv.get_techniques_detected_by_datacomponent(
+                dc0032["stix_id"], domain="enterprise", include_description=False, limit=50, offset=0
+            )
+        )
+        dc_p1 = asyncio.run(
+            srv.get_techniques_detected_by_datacomponent(
+                dc0032["stix_id"], domain="enterprise", include_description=False, limit=50, offset=50
+            )
+        )
+        self.assertEqual(dc_p0["count"], 50)
+        self.assertGreater(dc_p0["total_count"], 100)
+        self.assertTrue(dc_p0["has_more"])
+        self.assertEqual(dc_p0["next_offset"], 50)
+        self.assertEqual(dc_p1["offset"], 50)
+        self.assertTrue(set(t["stix_id"] for t in dc_p0["techniques"]).isdisjoint(t["stix_id"] for t in dc_p1["techniques"]))
 
 
 if __name__ == "__main__":
