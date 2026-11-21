@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>MITRE ATT&amp;CK MCP Server — mitre-attack.moukaeritai.work</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 780px;
+      margin: 2.5rem auto;
+      padding: 0 1.25rem;
+      line-height: 1.65;
+    }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: rgba(127, 127, 127, 0.12);
+      border-radius: 6px;
+    }
+    code { padding: 0.15em 0.4em; }
+    .card {
+      border: 1px solid rgba(127, 127, 127, 0.25);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1.25rem 0;
+    }
+    h1 { font-size: 1.6rem; margin-bottom: 0.4rem; }
+    h2 { font-size: 1.15rem; margin-top: 1.5rem; }
+  </style>
+</head>
+<body>
+  <h1>MITRE ATT&amp;CK MCP Server</h1>
+  <p>MITRE ATT&amp;CK（Enterprise / Mobile / ICS）の戦術・テクニック・脅威グループ・ソフトウェア情報を提供する Streamable HTTP MCP サーバーです（<code>imouiche/complete-mitre-attack-mcp-server</code> ベース）。</p>
+
+  <div class="card">
+    <h2>エンドポイント</h2>
+    <ul>
+      <li><strong>MCP (Streamable HTTP)</strong>: <code>https://mitre-attack.moukaeritai.work/mcp</code></li>
+      <li><strong>ヘルスチェック</strong>: <code>/healthz</code></li>
+    </ul>
+    <p><small>※ <code>/mcp</code> および <code>/healthz</code> へのアクセスは許可されたクライアント IP / Google Cloud MCP IP 帯域のみに制限されています。</small></p>
+  </div>
+
+  <h2>主な機能</h2>
+  <ul>
+    <li><strong>横断検索・フィルタ</strong>: 戦術（Tactic）、プラットフォーム、脅威グループ（APT）、マルウェア・正規ツール（Software）からの TTP 逆引き</li>
+    <li><strong>全ドメイン対応</strong>: Enterprise / Mobile / ICS（制御システム・アセット）を網羅する 65 以上の MCP ツール</li>
+    <li><strong>緩和策・検知データソース</strong>: 各テクニックに対する緩和策（Mitigations）と検知用データコンポーネントの参照</li>
+    <li><strong>ATT&amp;CK Navigator 連携</strong>: 検証済み／対象テクニックの Navigator レイヤー JSON 生成</li>
+    <li><strong>ローカル STIX キャッシュ</strong>: 公式 STIX 2.1 バンドルをホスト内へローカル保存して高速検索</li>
+  </ul>
+</body>
+</html>
