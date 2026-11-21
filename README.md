@@ -2,9 +2,9 @@
 
 # MITRE ATT&CK MCP Server
 
-**65 MCP tools giving LLMs and agentic systems machine-callable access to the MITRE ATT&CK knowledge base**
+**67 MCP tools giving LLMs and agentic systems machine-callable access to the MITRE ATT&CK knowledge base**
 
-[![MCP tools](https://img.shields.io/badge/MCP%20tools-65-0b7285)](#available-tools)
+[![MCP tools](https://img.shields.io/badge/MCP%20tools-67-0b7285)](#available-tools)
 [![Domains](https://img.shields.io/badge/domains-Enterprise%20%7C%20Mobile%20%7C%20ICS-0b7285)](#available-tools)
 [![ATT&CK](https://img.shields.io/badge/ATT%26CK-v20.1-1864ab)](#data-cache)
 [![npm](https://img.shields.io/npm/v/@imouiche/mitre-attack-mcp-server.svg)](https://www.npmjs.com/package/@imouiche/mitre-attack-mcp-server)
@@ -30,11 +30,11 @@ It reads the official STIX 2.1 bundles published by MITRE through the
 `mitreattack-python` library. No scraping, no third-party API, no
 reverse-engineered endpoints.
 
-### 65 tools across three domains
+### 67 tools across three domains
 
 | Area | Tools | Covers |
 |---|---:|---|
-| [Tactics, data sources and ICS](#tactics-data-sources-and-ics) | 12 | tactics, data components and what they detect, ICS assets, procedure examples |
+| [Tactics, data sources and ICS](#tactics-data-sources-and-ics) | 14 | tactics, data components, detection strategies and analytics, ICS assets, procedure examples |
 | [Techniques](#techniques) | 11 | lookup by ATT&CK ID, keyword search, parent and sub-technique traversal, platform and tactic filters |
 | [Generic STIX access](#generic-stix-access) | 10 | any object by STIX or ATT&CK ID, description search, created and modified filters, ID to name resolution |
 | [Groups](#groups) | 10 | threat actors, aliases, the techniques and software they use, campaign attribution |
@@ -153,7 +153,7 @@ Quit Claude Desktop completely (Cmd+Q on macOS) and reopen it.
 
 <div align="center">
 
-<a href="https://mcprush.com/to/imouiche-mitre-attack-mcp?ref=badge"><img width="380" height="200" src="https://mcprush.com/badge/imouiche-mitre-attack-mcp/card.svg" alt="MITRE ATT&CK MCP Server on MCPRush: security rating A, low access, no sign-in, 65 tools, 14 compatible clients" /></a>
+<a href="https://mcprush.com/to/imouiche-mitre-attack-mcp?ref=badge"><img width="380" height="200" src="https://mcprush.com/badge/imouiche-mitre-attack-mcp/card.svg" alt="MITRE ATT&CK MCP Server on MCPRush: security rating A, low access, no sign-in, 67 tools, 14 compatible clients" /></a>
 
 </div>
 
@@ -173,7 +173,7 @@ properties you can verify directly in this repository:
   is rejected rather than loaded.
 - **Local execution.** The server runs as a local stdio process. It opens no
   listening port and exposes no HTTP surface.
-- **Read-only behaviour.** All 65 tools are queries over the cached STIX data.
+- **Read-only behaviour.** All 67 tools are queries over the cached STIX data.
   Nothing mutates state outside the cache directory, and no tool executes shell
   commands or evaluates caller-supplied code.
 
@@ -261,9 +261,14 @@ whole `runtime` directory is safe; it is rebuilt on the next launch.
 
 ## Available Tools
 
-65 tools covering the major ATT&CK entities and their relationships. All tool
+67 tools covering the major ATT&CK entities and their relationships. All tool
 handlers are asynchronous. Most accept an optional `domain` argument of
-`enterprise`, `mobile` or `ics`, defaulting to `enterprise`.
+`enterprise`, `mobile` or `ics`, defaulting to `enterprise`, and list/search
+tools that can return large result sets (`get_analytics`,
+`get_objects_by_type`, `get_objects_created_after`,
+`get_objects_modified_after`, and `get_procedure_examples_by_tactic`) support
+optional `limit` (1–200, default 100) and `offset` (>= 0, default 0) pagination
+parameters.
 
 ### Infrastructure and metadata
 
@@ -372,6 +377,8 @@ a STIX ID rather than an ATT&CK ID.
 | `get_techniques_detected_by_datacomponent` | Techniques a data component can detect |
 | `get_procedure_examples_by_technique` | Procedure examples showing how groups used a technique |
 | `get_procedure_examples_by_tactic` | Procedure examples for all techniques in a tactic |
+| `get_detection_strategies_for_technique` | ATT&CK v20.1 detection strategies (`DETxxxx`), analytics (`ANxxxx`), and referenced data components (`DCxxxx`) for a technique STIX ID |
+| `get_analytics` | Search or list ATT&CK v20.1 analytics (`ANxxxx`) with optional `query`, `limit`/`offset` pagination, and `include_description` |
 
 ---
 
@@ -384,6 +391,8 @@ What are the aliases for the Lazarus Group?
 
 What data sources detect credential dumping?
 What can detect T1055 (Process Injection)?
+Which ATT&CK v20.1 detection strategies and analytics cover T1055?
+List analytics related to process injection
 List all techniques for Windows privilege escalation
 Show me lateral movement techniques for Linux
 
