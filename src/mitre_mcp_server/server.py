@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, List, Tuple, Dict, Any, Optional
 import os
@@ -189,6 +190,13 @@ attack_data: Dict[str, MitreAttackData] = {}
 
 # Simple list of domains that have been successfully loaded
 _loaded_domains: List[str] = []
+_loaded_at: Dict[str, str] = {}
+
+_SOURCE_INDEX_URL = "https://github.com/mitre-attack/attack-stix-data/blob/master/index.md"
+_SOURCE_REPOSITORY_URL = "https://github.com/mitre-attack/attack-stix-data"
+_KNOWN_SOURCE_RELEASE_DATES: Dict[str, str] = {
+    "20.1": "2026-11-05",
+}
 
 
 def load_domain(domain: str) -> bool:
@@ -227,6 +235,9 @@ def load_domain(domain: str) -> bool:
         attack_data[domain_key] = MitreAttackData(str(stix_path))
         if domain not in _loaded_domains:
             _loaded_domains.append(domain)
+        _loaded_at.setdefault(
+            domain, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
         return True
     except Exception as e:
         raise RuntimeError(f"Failed to load {domain} domain data: {e}") from e
@@ -279,8 +290,64 @@ def get_loaded_domains() -> List[str]:
     return _loaded_domains.copy()
 
 
+def _build_domain_provenance(
+    domain: str,
+    version: Optional[str] = None,
+    stix_path: Optional[Path] = None,
+    exists: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Build grounded release, origin, and freshness provenance for a domain."""
+    if stix_path is None:
+        stix_path = get_stix_path(domain)
+    if exists is None:
+        exists = stix_path.exists()
+
+    limitations = [
+        "Serves the local STIX bundle pinned by mitreattack-python (release_info.LATEST_VERSION); does not poll upstream GitHub at runtime.",
+        "Upstream currency beyond the loaded release is unknown without an external check against attack-stix-data.",
+        "local_file_modified_at reflects local disk write time, not upstream source publication time.",
+    ]
+
+    if not exists:
+        return {
+            "loaded_version": None,
+            "stix_spec_version": "2.1",
+            "source_url": None,
+            "source_index_url": _SOURCE_INDEX_URL,
+            "source_repository": _SOURCE_REPOSITORY_URL,
+            "source_release_date": None,
+            "source_release_date_known": False,
+            "local_file_modified_at": None,
+            "loaded_in_memory": domain in _loaded_domains,
+            "loaded_at": _loaded_at.get(domain),
+            "freshness_status": "missing_local_bundle",
+            "limitations": limitations,
+        }
+
+    ver = str(version) if version is not None else str(release_info.LATEST_VERSION)
+    source_release_date = _KNOWN_SOURCE_RELEASE_DATES.get(ver)
+    local_file_modified_at = datetime.fromtimestamp(
+        stix_path.stat().st_mtime, tz=timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return {
+        "loaded_version": ver,
+        "stix_spec_version": "2.1",
+        "source_url": f"https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/{domain}-attack/{domain}-attack-{ver}.json",
+        "source_index_url": _SOURCE_INDEX_URL,
+        "source_repository": _SOURCE_REPOSITORY_URL,
+        "source_release_date": source_release_date,
+        "source_release_date_known": source_release_date is not None,
+        "local_file_modified_at": local_file_modified_at,
+        "loaded_in_memory": domain in _loaded_domains,
+        "loaded_at": _loaded_at.get(domain),
+        "freshness_status": "pinned_local_release_upstream_unchecked",
+        "limitations": limitations,
+    }
+
+
 def _compute_data_stats() -> Dict[str, Any]:
-    """Internal helper: compute statistics about downloaded data."""
+    """Internal helper: compute statistics and provenance about downloaded data."""
     stats: Dict[str, Any] = {}
 
     for domain in DOMAINS:
@@ -288,20 +355,34 @@ def _compute_data_stats() -> Dict[str, Any]:
 
         if stix_path.exists():
             file_size_mb = stix_path.stat().st_size / (1024 * 1024)
+            provenance = _build_domain_provenance(
+                domain,
+                version=str(release_info.LATEST_VERSION),
+                stix_path=stix_path,
+                exists=True,
+            )
             stats[domain] = {
                 "exists": True,
                 "path": f"v{release_info.LATEST_VERSION}/{stix_path.name}",
                 "filename": stix_path.name,
                 "size_mb": round(file_size_mb, 2),
                 "version": release_info.LATEST_VERSION,
+                **provenance,
             }
         else:
+            provenance = _build_domain_provenance(
+                domain,
+                version=None,
+                stix_path=stix_path,
+                exists=False,
+            )
             stats[domain] = {
                 "exists": False,
                 "path": None,
                 "filename": None,
                 "size_mb": 0.0,
                 "version": None,
+                **provenance,
             }
 
     return stats
@@ -401,6 +482,12 @@ def _get_v20_detection_index(domain: str) -> Dict[str, Any]:
     ds_by_id = {_stix_get(d, "id"): d for d in det_strategies if _stix_get(d, "id")}
     an_by_id = {_stix_get(a, "id"): a for a in analytics if _stix_get(a, "id")}
     dc_by_id = {_stix_get(c, "id"): c for c in datacomponents if _stix_get(c, "id")}
+    an_attack_id_by_id: Dict[str, Optional[str]] = {}
+    for an_id in an_by_id:
+        try:
+            an_attack_id_by_id[an_id] = ad.get_attack_id(an_id)
+        except Exception:
+            an_attack_id_by_id[an_id] = None
 
     # Map detection strategy -> techniques and technique -> detection strategies
     tech_to_ds: Dict[str, List[str]] = {}
@@ -444,6 +531,7 @@ def _get_v20_detection_index(domain: str) -> Dict[str, Any]:
     index = {
         "ds_by_id": ds_by_id,
         "an_by_id": an_by_id,
+        "an_attack_id_by_id": an_attack_id_by_id,
         "dc_by_id": dc_by_id,
         "tech_to_ds": tech_to_ds,
         "ds_to_tech": ds_to_tech,
@@ -2365,6 +2453,7 @@ async def get_stats(
     return {
         "domain": domain_norm,
         "stats": stats,
+        "provenance": _build_domain_provenance(domain_norm),
         "message": (
             f"ATT&CK object statistics for domain '{domain_norm}': "
             f"{stats['techniques']} techniques, "
@@ -9440,18 +9529,27 @@ async def get_analytics(
 ) -> Dict[str, Any]:
     """
     Search or list ATT&CK v20.1 analytics (x-mitre-analytic / ANxxxx) with pagination.
+
+    Matches exact analytic ATT&CK IDs (e.g., "AN2292") or STIX IDs
+    (case-insensitive, surrounding whitespace ignored) as well as case-insensitive
+    substring matches in analytic names or descriptions.
     """
     _validate_pagination(limit, offset)
     ad = get_attack_data(domain)
     v20_idx = _get_v20_detection_index(domain)
     q = (query or "").strip().lower()
+    an_attack_id_by_id = v20_idx.get("an_attack_id_by_id", {})
 
     matched = []
     for an_id, an_obj in v20_idx["an_by_id"].items():
-        name = _stix_get(an_obj, "name", "") or ""
-        desc = _stix_get(an_obj, "description", "") or ""
-        if q and q not in name.lower() and q not in desc.lower():
-            continue
+        if q:
+            an_aid = an_attack_id_by_id.get(an_id) or ""
+            name = _stix_get(an_obj, "name", "") or ""
+            desc = _stix_get(an_obj, "description", "") or ""
+            exact_id_match = (q == str(an_id).lower()) or (bool(an_aid) and q == str(an_aid).lower())
+            text_match = (q in name.lower()) or (q in desc.lower())
+            if not (exact_id_match or text_match):
+                continue
         matched.append((an_id, an_obj))
 
     matched.sort(key=lambda pair: str(pair[0] or ""))
@@ -9461,10 +9559,12 @@ async def get_analytics(
 
     items = []
     for an_id, an_obj in page:
-        try:
-            an_aid = ad.get_attack_id(an_id)
-        except Exception:
-            an_aid = None
+        an_aid = an_attack_id_by_id.get(an_id)
+        if an_aid is None:
+            try:
+                an_aid = ad.get_attack_id(an_id)
+            except Exception:
+                an_aid = None
         items.append({
             "attack_id": an_aid,
             "name": _stix_get(an_obj, "name"),

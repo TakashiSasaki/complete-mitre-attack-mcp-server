@@ -715,6 +715,107 @@ class TestGroupSoftwareProvenanceAndRegressions(unittest.TestCase):
         self.assertTrue(lm_ics["success"])
         self.assertIn("None", lm_ics["metadata"]["filters"]["platforms"])
 
+    def test_get_analytics_exact_id_and_text_search(self) -> None:
+        target_stix = "x-mitre-analytic--6c25c2ec-01f9-4447-beb7-b8669c320a9c"
+
+        # 1. Exact ATT&CK ID match (DET0941 -> AN2292)
+        res_exact = asyncio.run(srv.get_analytics(query="AN2292", domain="enterprise"))
+        self.assertEqual(res_exact["count"], 1)
+        self.assertEqual(res_exact["total_count"], 1)
+        self.assertFalse(res_exact["has_more"])
+        self.assertIsNone(res_exact["next_offset"])
+        self.assertEqual(res_exact["analytics"][0]["attack_id"], "AN2292")
+        self.assertEqual(res_exact["analytics"][0]["stix_id"], target_stix)
+        self.assertEqual(res_exact["analytics"][0]["name"], "Analytic 2292")
+        self.assertEqual(res_exact["analytics"][0]["platforms"], ["SaaS"])
+
+        # 2. Case-insensitive and surrounding whitespace
+        res_ci_ws = asyncio.run(srv.get_analytics(query="  an2292  ", domain="enterprise"))
+        self.assertEqual(res_ci_ws["count"], 1)
+        self.assertEqual(res_ci_ws["analytics"][0]["attack_id"], "AN2292")
+
+        # 3. Exact STIX ID match (case-insensitive + whitespace)
+        res_stix = asyncio.run(srv.get_analytics(query=f"  {target_stix.upper()}  ", domain="enterprise"))
+        self.assertEqual(res_stix["count"], 1)
+        self.assertEqual(res_stix["analytics"][0]["attack_id"], "AN2292")
+
+        # 4. No false match on partial ATT&CK ID prefix
+        res_partial = asyncio.run(srv.get_analytics(query="AN22", domain="enterprise"))
+        self.assertEqual(res_partial["count"], 0)
+        self.assertEqual(res_partial["total_count"], 0)
+        self.assertEqual(res_partial["analytics"], [])
+
+        # 5. Invalid/nonexistent query
+        res_invalid = asyncio.run(srv.get_analytics(query="AN999999", domain="enterprise"))
+        self.assertEqual(res_invalid["count"], 0)
+        self.assertEqual(res_invalid["total_count"], 0)
+        self.assertFalse(res_invalid["has_more"])
+        self.assertIsNone(res_invalid["next_offset"])
+        self.assertEqual(res_invalid["analytics"], [])
+
+        # 6. Existing name/description substring search preserved
+        res_name = asyncio.run(srv.get_analytics(query="Analytic 2292", domain="enterprise"))
+        self.assertEqual(res_name["count"], 1)
+        self.assertEqual(res_name["analytics"][0]["attack_id"], "AN2292")
+
+        res_desc = asyncio.run(srv.get_analytics(query="AI application", domain="enterprise"))
+        self.assertGreaterEqual(res_desc["total_count"], 1)
+        self.assertIn("AN2292", [a["attack_id"] for a in res_desc["analytics"]])
+
+    def test_release_freshness_provenance_metadata(self) -> None:
+        # Ensure enterprise is loaded so loaded_in_memory / loaded_at are populated
+        srv.get_attack_data("enterprise")
+
+        dstats = asyncio.run(srv.get_data_stats())
+        self.assertEqual(set(dstats.keys()), {"enterprise", "mobile", "ics"})
+        for domain, info in dstats.items():
+            self.assertTrue(info["exists"])
+            self.assertEqual(info["version"], "20.1")
+            self.assertEqual(info["loaded_version"], "20.1")
+            self.assertEqual(info["stix_spec_version"], "2.1")
+            self.assertEqual(
+                info["source_url"],
+                f"https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/{domain}-attack/{domain}-attack-20.1.json",
+            )
+            self.assertEqual(
+                info["source_index_url"],
+                "https://github.com/mitre-attack/attack-stix-data/blob/master/index.md",
+            )
+            self.assertEqual(
+                info["source_repository"],
+                "https://github.com/mitre-attack/attack-stix-data",
+            )
+            self.assertEqual(info["source_release_date"], "2026-11-05")
+            self.assertTrue(info["source_release_date_known"])
+            self.assertIsInstance(info["local_file_modified_at"], str)
+            self.assertTrue(info["local_file_modified_at"].endswith("Z"))
+            self.assertNotEqual(info["local_file_modified_at"][:10], info["source_release_date"])
+            self.assertEqual(info["freshness_status"], "pinned_local_release_upstream_unchecked")
+            self.assertTrue(info["limitations"])
+
+        self.assertTrue(dstats["enterprise"]["loaded_in_memory"])
+        self.assertIsInstance(dstats["enterprise"]["loaded_at"], str)
+        self.assertTrue(dstats["enterprise"]["loaded_at"].endswith("Z"))
+
+        # Unknown version does not fabricate a source release date
+        unknown_prov = srv._build_domain_provenance("enterprise", version="99.9", exists=True)
+        self.assertIsNone(unknown_prov["source_release_date"])
+        self.assertFalse(unknown_prov["source_release_date_known"])
+
+        # Missing bundle reports missing_local_bundle without fabricating dates
+        missing_prov = srv._build_domain_provenance("enterprise", exists=False)
+        self.assertEqual(missing_prov["freshness_status"], "missing_local_bundle")
+        self.assertIsNone(missing_prov["source_url"])
+        self.assertIsNone(missing_prov["local_file_modified_at"])
+
+        # get_stats preserves existing fields and includes grounded provenance
+        st = asyncio.run(srv.get_stats(domain="Enterprise"))
+        self.assertEqual(st["domain"], "enterprise")
+        self.assertIn("stats", st)
+        self.assertIn("message", st)
+        self.assertEqual(st["provenance"]["loaded_version"], "20.1")
+        self.assertEqual(st["provenance"]["source_release_date"], "2026-11-05")
+
 
 if __name__ == "__main__":
     unittest.main()
