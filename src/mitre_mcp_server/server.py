@@ -1038,11 +1038,23 @@ async def get_objects_by_content(
     """
     attack_data = get_attack_data(domain)
     norm_type = (object_type or "").strip().lower()
+    content_clean = (content or "").strip()
+
+    if not content_clean:
+        return {
+            "count": 0,
+            "objects": [],
+            "formatted": "",
+            "message": (
+                f"No '{norm_type}' objects matched blank content query "
+                f"in domain '{domain}'."
+            ),
+        }
 
     # Perform text search
     try:
         objs = attack_data.get_objects_by_content(
-            content,
+            content_clean,
             norm_type,
             remove_revoked_deprecated=remove_revoked_deprecated,
         )
@@ -1275,12 +1287,22 @@ async def search_techniques(
     """
     attack_data = get_attack_data(domain)
 
+    query_lower = (query or "").strip().lower()
+    if not query_lower:
+        return {
+            "count": 0,
+            "techniques": [],
+            "formatted": "",
+            "message": (
+                f"No techniques in domain '{domain}' matched the query '{query}'."
+            ),
+        }
+
     try:
         all_techniques = attack_data.get_techniques(remove_revoked_deprecated=True)
     except Exception:
         all_techniques = []
 
-    query_lower = query.lower()
     matched: List[Any] = []
 
     for tech in all_techniques:
@@ -1987,7 +2009,17 @@ async def search_software(
             "message": f"No software found in domain '{domain}'.",
         }
 
-    query_lower = query.lower()
+    query_lower = (query or "").strip().lower()
+    if not query_lower:
+        return {
+            "count": 0,
+            "software": [],
+            "formatted": "",
+            "message": (
+                f"No software objects in domain '{domain}' matched query '{query}'."
+            ),
+        }
+
     matched = []
 
     # Software search loop
@@ -2351,6 +2383,7 @@ async def get_groups_by_alias(
     alias: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Get APT groups (intrusion sets) matching a given alias.
@@ -2365,6 +2398,7 @@ async def get_groups_by_alias(
         alias: Alias to search for (e.g., "Cozy Bear", "NOBELIUM").
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include group descriptions.
+        remove_revoked_deprecated: Whether to exclude revoked/deprecated groups (default: True).
 
     Returns:
         {
@@ -2384,21 +2418,28 @@ async def get_groups_by_alias(
         }
     """
     attack_data = get_attack_data(domain)
+    alias_norm = (alias or "").strip().lower()
 
-    try:
-        raw_groups = attack_data.get_groups_by_alias(alias) or []
-    except Exception:
-        raw_groups = []
-
-    if not raw_groups and alias:
-        alias_norm = alias.strip().lower()
+    raw_groups: List[Any] = []
+    if alias_norm:
         try:
-            all_groups = attack_data.get_groups(remove_revoked_deprecated=True) or []
+            all_groups = attack_data.get_groups(
+                remove_revoked_deprecated=remove_revoked_deprecated
+            ) or []
             raw_groups = [
                 g for g in all_groups
-                if alias_norm == (_stix_get(g, "name", "") or "").lower()
-                or any(alias_norm == (a or "").lower() for a in (_stix_get(g, "aliases", []) or []))
+                if alias_norm == (_stix_get(g, "name", "") or "").strip().lower()
+                or any(
+                    alias_norm == (a or "").strip().lower()
+                    for a in (_stix_get(g, "aliases", []) or [])
+                )
             ]
+            raw_groups.sort(
+                key=lambda g: (
+                    (_stix_get(g, "name", "") or "").lower(),
+                    str(_stix_get(g, "id", "") or ""),
+                )
+            )
         except Exception:
             raw_groups = []
 
@@ -2931,6 +2972,7 @@ async def get_campaigns_by_alias(
     alias: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Get campaigns by their alias.
@@ -2942,6 +2984,7 @@ async def get_campaigns_by_alias(
         alias: Campaign alias or alternate name (case-insensitive)
         domain: ATT&CK domain ("enterprise", "ics", etc.)
         include_description: Include campaign descriptions in output
+        remove_revoked_deprecated: Whether to exclude revoked/deprecated campaigns (default: True).
 
     Returns:
         {
@@ -2961,25 +3004,29 @@ async def get_campaigns_by_alias(
         }
     """
     attack_data = get_attack_data(domain)
+    alias_norm = (alias or "").strip().lower()
 
-    # Retrieve matching campaigns
-    try:
-        campaigns = attack_data.get_campaigns_by_alias(alias) or []
-    except Exception:
-        campaigns = []
-
-    if not campaigns and alias:
-        alias_norm = alias.strip().lower()
+    # Exact case-insensitive match against campaign name and aliases
+    campaigns: List[Any] = []
+    if alias_norm:
         try:
-            all_campaigns = attack_data.get_campaigns(remove_revoked_deprecated=True) or []
+            all_campaigns = attack_data.get_campaigns(
+                remove_revoked_deprecated=remove_revoked_deprecated
+            ) or []
             campaigns = [
                 c for c in all_campaigns
-                if alias_norm == (_stix_get(c, "name", "") or "").lower()
+                if alias_norm == (_stix_get(c, "name", "") or "").strip().lower()
                 or any(
-                    alias_norm == (a or "").lower()
+                    alias_norm == (a or "").strip().lower()
                     for a in (_stix_get(c, "aliases") or _stix_get(c, "x_mitre_aliases") or [])
                 )
             ]
+            campaigns.sort(
+                key=lambda c: (
+                    (_stix_get(c, "name", "") or "").lower(),
+                    str(_stix_get(c, "id", "") or ""),
+                )
+            )
         except Exception:
             campaigns = []
 
@@ -3853,6 +3900,7 @@ async def get_software_by_alias(
     alias: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Find software/malware by alias (e.g., 'Beacon', 'Mimilib').
@@ -3864,6 +3912,7 @@ async def get_software_by_alias(
         alias: Alias to search for.
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include description fields.
+        remove_revoked_deprecated: Whether to exclude revoked/deprecated software (default: True).
 
     Returns:
         {
@@ -3885,25 +3934,29 @@ async def get_software_by_alias(
         }
     """
     attack_data = get_attack_data(domain)
+    alias_norm = (alias or "").strip().lower()
 
-    # Query the underlying library
-    try:
-        results = attack_data.get_software_by_alias(alias) or []
-    except Exception:
-        results = []
-
-    if not results and alias:
-        alias_norm = alias.strip().lower()
+    # Exact case-insensitive match against software name and aliases
+    results: List[Any] = []
+    if alias_norm:
         try:
-            all_sw = attack_data.get_software(remove_revoked_deprecated=True) or []
+            all_sw = attack_data.get_software(
+                remove_revoked_deprecated=remove_revoked_deprecated
+            ) or []
             results = [
                 sw for sw in all_sw
-                if alias_norm == (_stix_get(sw, "name", "") or "").lower()
+                if alias_norm == (_stix_get(sw, "name", "") or "").strip().lower()
                 or any(
-                    alias_norm == (a or "").lower()
+                    alias_norm == (a or "").strip().lower()
                     for a in (_stix_get(sw, "x_mitre_aliases") or _stix_get(sw, "aliases") or [])
                 )
             ]
+            results.sort(
+                key=lambda sw: (
+                    (_stix_get(sw, "name", "") or "").lower(),
+                    str(_stix_get(sw, "id", "") or ""),
+                )
+            )
         except Exception:
             results = []
 
@@ -6735,38 +6788,50 @@ async def get_techniques_by_platform(
         "azure ad": "Identity Provider",
         "office 365": "Office Suite",
         "google workspace": "Office Suite",
+        "network": "Network Devices",
     }
     raw_plat = (platform or "").strip()
+    if not raw_plat:
+        safe_limit, safe_offset = _validate_pagination(limit, offset)
+        return {
+            "platform": "",
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "techniques": [],
+            "formatted": "",
+            "message": (
+                f"No techniques found for platform '' "
+                f"in domain '{domain}'."
+            ),
+        }
+
     plat_norm = platform_aliases.get(raw_plat.lower(), raw_plat)
 
-    # Resolve canonical platform casing from loaded techniques
+    # Resolve canonical platform casing and filter exact case-insensitively
     canonical_platform = plat_norm
+    techniques: List[Any] = []
     try:
-        all_techs = attack_data.get_techniques(remove_revoked_deprecated=remove_revoked_deprecated) or []
-        known_platforms = {}
+        all_techs = attack_data.get_techniques(
+            remove_revoked_deprecated=remove_revoked_deprecated
+        ) or []
+        known_platforms: Dict[str, str] = {}
         for t in all_techs:
             for p in (_stix_get(t, "x_mitre_platforms", []) or []):
                 known_platforms[p.lower()] = p
         if plat_norm.lower() in known_platforms:
             canonical_platform = known_platforms[plat_norm.lower()]
-    except Exception:
-        pass
-
-    try:
-        techniques = attack_data.get_techniques_by_platform(
-            canonical_platform,
-            remove_revoked_deprecated=remove_revoked_deprecated,
-        ) or []
-    except TypeError:
-        try:
-            techniques = attack_data.get_techniques_by_platform(canonical_platform) or []
-        except Exception:
-            techniques = []
-        if remove_revoked_deprecated:
-            techniques = [
-                t for t in techniques
-                if not _stix_get(t, "revoked", False) and not _stix_get(t, "x_mitre_deprecated", False)
-            ]
+        target_plat_lower = canonical_platform.lower()
+        techniques = [
+            t for t in all_techs
+            if any(
+                (p or "").strip().lower() == target_plat_lower
+                for p in (_stix_get(t, "x_mitre_platforms", []) or [])
+            )
+        ]
     except Exception:
         techniques = []
 
@@ -9232,13 +9297,13 @@ async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
         "tacticRowBackground": "#dddddd",
     }
 
-    # Domain → platform filter mappings
+    # Domain → platform filter mappings (aligned with ATT&CK v20.1 STIX x_mitre_platforms)
     domain_configs = {
         "enterprise": {
             "domain": "enterprise-attack",
             "filters": {
                 "platforms": [
-                    "Windows", "Linux", "macOS", "Network", "PRE",
+                    "Windows", "Linux", "macOS", "Network Devices", "ESXi", "PRE",
                     "Containers", "IaaS", "SaaS", "Office Suite",
                     "Identity Provider"
                 ]
@@ -9250,12 +9315,12 @@ async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
         },
         "ics": {
             "domain": "ics-attack",
-            "filters": {"platforms": ["Embedded", "Linux", "Network Devices", "Windows"]},
+            "filters": {"platforms": ["Embedded", "Linux", "Network Devices", "None", "Windows"]},
         },
     }
 
     # Normalize domain
-    domain = domain.lower()
+    domain = (domain or "enterprise").strip().lower()
     if domain not in domain_configs:
         return {
             "success": False,

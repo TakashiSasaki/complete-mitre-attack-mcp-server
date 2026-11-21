@@ -635,6 +635,86 @@ class TestGroupSoftwareProvenanceAndRegressions(unittest.TestCase):
         self.assertFalse(bad_dom["success"])
         self.assertIn("Invalid domain", bad_dom["message"])
 
+    def test_deep_audit_fixes(self) -> None:
+        # 1. Exact case-insensitive alias lookup without substring collisions or revoked leakage
+        apt1 = asyncio.run(srv.get_groups_by_alias("APT1", domain="enterprise", include_description=False))
+        self.assertEqual(apt1["count"], 1)
+        self.assertEqual(apt1["groups"][0]["name"], "APT1")
+
+        apt3 = asyncio.run(srv.get_groups_by_alias("APT3", domain="enterprise", include_description=False))
+        self.assertEqual(apt3["count"], 1)
+        self.assertEqual(apt3["groups"][0]["name"], "APT3")
+
+        grp_at = asyncio.run(srv.get_groups_by_alias("at", domain="enterprise", include_description=False))
+        self.assertEqual(grp_at["count"], 0)
+
+        grp_rev_default = asyncio.run(srv.get_groups_by_alias("Night Dragon", domain="enterprise", include_description=False))
+        self.assertEqual(grp_rev_default["count"], 0)
+        grp_rev_all = asyncio.run(
+            srv.get_groups_by_alias("Night Dragon", domain="enterprise", include_description=False, remove_revoked_deprecated=False)
+        )
+        self.assertEqual(grp_rev_all["count"], 1)
+
+        sw_at = asyncio.run(srv.get_software_by_alias("at", domain="enterprise", include_description=False))
+        self.assertEqual(sw_at["count"], 1)
+        self.assertEqual(sw_at["software"][0]["name"], "at")
+
+        sw_net = asyncio.run(srv.get_software_by_alias("net", domain="enterprise", include_description=False))
+        self.assertEqual(sw_net["count"], 1)
+        self.assertEqual(sw_net["software"][0]["name"], "Net")
+
+        sw_tor = asyncio.run(srv.get_software_by_alias("Tor", domain="enterprise", include_description=False))
+        self.assertEqual(sw_tor["count"], 1)
+        self.assertEqual(sw_tor["software"][0]["name"], "Tor")
+
+        sw_ping = asyncio.run(srv.get_software_by_alias("Ping", domain="enterprise", include_description=False))
+        self.assertEqual(sw_ping["count"], 1)
+        self.assertEqual(sw_ping["software"][0]["name"], "Ping")
+
+        sw_darkmoon = asyncio.run(srv.get_software_by_alias("Darkmoon", domain="enterprise", include_description=False))
+        self.assertEqual(sw_darkmoon["count"], 1)
+        self.assertEqual(sw_darkmoon["software"][0]["name"], "PoisonIvy")
+
+        camp_at = asyncio.run(srv.get_campaigns_by_alias("at", domain="enterprise", include_description=False))
+        self.assertEqual(camp_at["count"], 0)
+        camp_op = asyncio.run(srv.get_campaigns_by_alias("Operation", domain="enterprise", include_description=False))
+        self.assertEqual(camp_op["count"], 0)
+
+        # 2. get_techniques_by_platform rejects blank/whitespace and avoids substring collisions
+        plat_blank = asyncio.run(srv.get_techniques_by_platform("   ", domain="enterprise", include_description=False))
+        self.assertEqual(plat_blank["count"], 0)
+        self.assertEqual(plat_blank["total_count"], 0)
+
+        plat_win_partial = asyncio.run(srv.get_techniques_by_platform("Win", domain="enterprise", include_description=False))
+        self.assertEqual(plat_win_partial["count"], 0)
+
+        plat_a = asyncio.run(srv.get_techniques_by_platform("a", domain="enterprise", include_description=False))
+        self.assertEqual(plat_a["count"], 0)
+
+        plat_net = asyncio.run(srv.get_techniques_by_platform("Network", domain="enterprise", include_description=False, limit=5))
+        self.assertEqual(plat_net["platform"], "Network Devices")
+        self.assertEqual(plat_net["total_count"], 100)
+
+        # 3. Whitespace-only queries in search_techniques, search_software, get_objects_by_content return 0
+        self.assertEqual(asyncio.run(srv.search_techniques("   ", domain="enterprise"))["count"], 0)
+        self.assertEqual(asyncio.run(srv.search_software("   ", domain="enterprise"))["count"], 0)
+        self.assertEqual(
+            asyncio.run(srv.get_objects_by_content("   ", "attack-pattern", domain="enterprise"))["count"], 0
+        )
+
+        # 4. get_layer_metadata reflects ATT&CK v20.1 platforms and strips domain whitespace
+        lm_ent = asyncio.run(srv.get_layer_metadata(" enterprise "))
+        self.assertTrue(lm_ent["success"])
+        self.assertEqual(lm_ent["domain"], "enterprise")
+        ent_plats = set(lm_ent["metadata"]["filters"]["platforms"])
+        self.assertIn("ESXi", ent_plats)
+        self.assertIn("Network Devices", ent_plats)
+        self.assertNotIn("Network", ent_plats)
+
+        lm_ics = asyncio.run(srv.get_layer_metadata("ics"))
+        self.assertTrue(lm_ics["success"])
+        self.assertIn("None", lm_ics["metadata"]["filters"]["platforms"])
+
 
 if __name__ == "__main__":
     unittest.main()
