@@ -2008,10 +2008,333 @@ async def get_techniques_by_tactic(
         ),
     }
 
+_DOMAIN_SORT_RANK: Dict[str, int] = {
+    "enterprise": 0,
+    "mobile": 1,
+    "ics": 2,
+}
+
+
+def _format_cross_domain_techniques(
+    items: List[Tuple[str, Any, Optional[str]]],
+    include_description: bool = False,
+) -> str:
+    """Format cross-domain technique tuples (domain, stix_obj, attack_id) into a readable string."""
+    blocks: List[str] = []
+    for dom, obj, attack_id in items:
+        obj = _unwrap_stix_object(obj)
+        if obj is None:
+            continue
+        lines: List[str] = []
+        name = _stix_get(obj, "name")
+        if name:
+            lines.append(f"Name: {name}")
+        lines.append(f"Domain: {dom}")
+        if attack_id:
+            lines.append(f"ID: {attack_id}")
+        stix_id = _stix_get(obj, "id")
+        if stix_id:
+            lines.append(f"STIX ID: {stix_id}")
+        description = _stix_get(obj, "description")
+        if include_description and description:
+            lines.append(f"Description: {description}")
+        blocks.append("\n".join(lines))
+    return "\n---\n".join(blocks)
+
+
+def _search_techniques_all_domains(
+    query: str,
+    include_description: bool,
+    limit: int,
+    offset: int,
+    include_formatted: bool,
+) -> Dict[str, Any]:
+    """Perform cross-domain search across enterprise, mobile, and ics local STIX bundles."""
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
+    query_lower = (query or "").strip().lower()
+
+    domain_status: Dict[str, Dict[str, Any]] = {}
+    unavailable_domains: List[str] = []
+    loaded_adapters: Dict[str, Any] = {}
+
+    for dom in DOMAINS:
+        stix_path = get_stix_path(dom)
+        exists = stix_path.exists()
+        if not exists:
+            prov = _build_domain_provenance(dom, version=None, stix_path=stix_path, exists=False)
+            domain_status[dom] = {
+                "status": "UNAVAILABLE",
+                "available": False,
+                "match_count": None,
+                "loaded_version": prov["loaded_version"],
+                "stix_spec_version": prov["stix_spec_version"],
+                "source_url": prov["source_url"],
+                "source_release_date": prov["source_release_date"],
+                "freshness_status": prov["freshness_status"],
+                "error": f"STIX data file not found for domain '{dom}'.",
+            }
+            unavailable_domains.append(dom)
+            continue
+
+        try:
+            ad = get_attack_data(dom)
+            loaded_adapters[dom] = ad
+            prov = _build_domain_provenance(
+                dom,
+                version=str(release_info.LATEST_VERSION),
+                stix_path=stix_path,
+                exists=True,
+            )
+            domain_status[dom] = {
+                "status": "OK",
+                "available": True,
+                "match_count": 0,
+                "loaded_version": prov["loaded_version"],
+                "stix_spec_version": prov["stix_spec_version"],
+                "source_url": prov["source_url"],
+                "source_release_date": prov["source_release_date"],
+                "freshness_status": prov["freshness_status"],
+            }
+        except Exception as e:
+            prov = _build_domain_provenance(dom, version=None, stix_path=stix_path, exists=False)
+            domain_status[dom] = {
+                "status": "UNAVAILABLE",
+                "available": False,
+                "match_count": None,
+                "loaded_version": None,
+                "stix_spec_version": prov["stix_spec_version"],
+                "source_url": None,
+                "source_release_date": None,
+                "freshness_status": "domain_load_failed",
+                "error": f"Failed to load STIX data for domain '{dom}': {e}",
+            }
+            unavailable_domains.append(dom)
+
+    ver_str = str(release_info.LATEST_VERSION)
+    release_date = _KNOWN_SOURCE_RELEASE_DATES.get(ver_str)
+    limitations = [
+        "Serves the local STIX bundles pinned by mitreattack-python (release_info.LATEST_VERSION); does not poll upstream GitHub at runtime.",
+        "Upstream currency beyond the loaded release is unknown without an external check against attack-stix-data.",
+    ]
+
+    if unavailable_domains:
+        metadata_err = {
+            "attack_version": ver_str,
+            "stix_spec_version": "2.1",
+            "source_repository": _SOURCE_REPOSITORY_URL,
+            "source_index_url": _SOURCE_INDEX_URL,
+            "source_release_date": release_date,
+            "source_release_date_known": release_date is not None,
+            "freshness_status": "incomplete_missing_domain_bundle",
+            "complete": False,
+            "partial": len(unavailable_domains) < len(DOMAINS),
+            "unavailable_domains": list(unavailable_domains),
+            "limitations": limitations,
+        }
+        return {
+            "found": False,
+            "error_code": "DOMAIN_UNAVAILABLE",
+            "domain": "all",
+            "domains_searched": list(DOMAINS),
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "techniques": [],
+            "domain_status": domain_status,
+            "metadata": metadata_err,
+            "formatted": "",
+            "message": (
+                f"Cross-domain search failed closed because domain(s) "
+                f"{', '.join(unavailable_domains)} are unavailable."
+            ),
+        }
+
+    metadata_ok = {
+        "attack_version": ver_str,
+        "stix_spec_version": "2.1",
+        "source_repository": _SOURCE_REPOSITORY_URL,
+        "source_index_url": _SOURCE_INDEX_URL,
+        "source_release_date": release_date,
+        "source_release_date_known": release_date is not None,
+        "freshness_status": "pinned_local_release_upstream_unchecked",
+        "complete": True,
+        "partial": False,
+        "unavailable_domains": [],
+        "limitations": limitations,
+    }
+
+    if not query_lower:
+        return {
+            "domain": "all",
+            "domains_searched": list(DOMAINS),
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "techniques": [],
+            "domain_status": domain_status,
+            "metadata": metadata_ok,
+            "formatted": "",
+            "message": (
+                f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'."
+            ),
+        }
+
+    # Collect matches per domain without collapsing same name or same attack_id across domains
+    matched_records: List[Tuple[str, Any, Optional[str], str, str]] = []
+    for dom in DOMAINS:
+        ad = loaded_adapters[dom]
+        try:
+            dom_techniques = ad.get_techniques(remove_revoked_deprecated=True) or []
+        except Exception as e:
+            domain_status[dom]["status"] = "UNAVAILABLE"
+            domain_status[dom]["available"] = False
+            domain_status[dom]["match_count"] = None
+            domain_status[dom]["error"] = f"Failed to query techniques for domain '{dom}': {e}"
+            unavailable_domains.append(dom)
+            continue
+
+        dom_matches = 0
+        for tech in dom_techniques:
+            name = _stix_get(tech, "name") or ""
+            description = _stix_get(tech, "description") or ""
+            if query_lower in name.lower() or query_lower in description.lower():
+                dom_matches += 1
+                stix_id = _stix_get(tech, "id") or ""
+                attack_id = None
+                if stix_id:
+                    try:
+                        attack_id = ad.get_attack_id(stix_id)
+                    except Exception:
+                        attack_id = None
+                matched_records.append((dom, tech, attack_id, str(name), str(stix_id)))
+        domain_status[dom]["match_count"] = dom_matches
+
+    if unavailable_domains:
+        metadata_ok["complete"] = False
+        metadata_ok["partial"] = len(unavailable_domains) < len(DOMAINS)
+        metadata_ok["unavailable_domains"] = list(unavailable_domains)
+        metadata_ok["freshness_status"] = "incomplete_missing_domain_bundle"
+        return {
+            "found": False,
+            "error_code": "DOMAIN_UNAVAILABLE",
+            "domain": "all",
+            "domains_searched": list(DOMAINS),
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "techniques": [],
+            "domain_status": domain_status,
+            "metadata": metadata_ok,
+            "formatted": "",
+            "message": (
+                f"Cross-domain search failed closed because domain(s) "
+                f"{', '.join(unavailable_domains)} failed during retrieval."
+            ),
+        }
+
+    if not matched_records:
+        return {
+            "domain": "all",
+            "domains_searched": list(DOMAINS),
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "techniques": [],
+            "domain_status": domain_status,
+            "metadata": metadata_ok,
+            "formatted": "",
+            "message": (
+                f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'."
+            ),
+        }
+
+    # Deterministic global sort: name ascending, domain rank (enterprise, mobile, ics), attack_id, stix_id
+    matched_sorted = sorted(
+        matched_records,
+        key=lambda rec: (
+            rec[3],
+            _DOMAIN_SORT_RANK.get(rec[0], 99),
+            str(rec[2] or "").upper(),
+            rec[4],
+        ),
+    )
+
+    page_records, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        matched_sorted, limit=limit, offset=offset
+    )
+
+    structured: List[Dict[str, Any]] = []
+    fmt_tuples: List[Tuple[str, Any, Optional[str]]] = []
+    for dom, tech, attack_id, name, stix_id in page_records:
+        description = _stix_get(tech, "description") if include_description else None
+        structured.append(
+            {
+                "domain": dom,
+                "attack_id": attack_id,
+                "name": name,
+                "stix_id": stix_id,
+                "description": description,
+            }
+        )
+        fmt_tuples.append((dom, tech, attack_id))
+
+    formatted = (
+        _format_cross_domain_techniques(
+            fmt_tuples,
+            include_description=include_description,
+        )
+        if include_formatted
+        else ""
+    )
+
+    per_dom_summary = ", ".join(
+        f"{dom}={domain_status[dom]['match_count']}" for dom in DOMAINS
+    )
+    return {
+        "domain": "all",
+        "domains_searched": list(DOMAINS),
+        "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
+        "techniques": structured,
+        "domain_status": domain_status,
+        "metadata": metadata_ok,
+        "formatted": formatted,
+        "message": (
+            f"Found {total_count} technique(s) across domains ({per_dom_summary}) "
+            f"matching query '{query}' (returning {len(structured)} at offset {safe_offset})."
+        ),
+    }
+
+
 @mcp.tool()
 async def search_techniques(
     query: str,
-    domain: str = "enterprise",
+    domain: Annotated[
+        str,
+        Field(
+            default="enterprise",
+            description=(
+                "ATT&CK domain to search: 'enterprise' (default), 'mobile', 'ics', "
+                "or 'all' for cross-domain retrieval across Enterprise, Mobile, and ICS."
+            ),
+        ),
+    ] = "enterprise",
     include_description: bool = True,
     limit: PageLimit = DEFAULT_PAGE_LIMIT,
     offset: PageOffset = 0,
@@ -2021,19 +2344,28 @@ async def search_techniques(
     Search MITRE ATT&CK techniques by keyword in their name or description.
 
     This tool performs a case-insensitive search over all non-revoked,
-    non-deprecated techniques in the given domain. A technique is matched if
-    the query string appears in either:
+    non-deprecated techniques in the given domain (or across all three domains
+    when `domain="all"`). A technique is matched if the query string appears in either:
       • the technique name, or
       • the technique description
+
+    Cross-domain mode (`domain="all"`):
+      • Searches Enterprise, Mobile, and ICS local STIX v20.1 bundles in one call.
+      • Preserves per-hit `domain` disambiguation (never collapses techniques across domains).
+      • Applies deterministic global ordering and global `offset`/`limit` pagination.
+      • Includes `domain_status` and `metadata` provenance (release version, source release
+        date, source URLs, and freshness limitations) and fails closed (`DOMAIN_UNAVAILABLE`)
+        if any domain bundle is missing or fails to load.
 
     Examples:
         - search_techniques("PowerShell")
         - search_techniques("credential dumping")
         - search_techniques("initial access", domain="enterprise")
+        - search_techniques("Command", domain="all", limit=10, include_description=False, include_formatted=False)
 
     Args:
         query: Text to search for in technique names and descriptions.
-        domain: ATT&CK domain ("enterprise", "mobile", or "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", or "all").
         include_description: Whether to include descriptions in the structured
                              result and formatted output.
         limit: Maximum number of items to return per page (1-200).
@@ -2054,6 +2386,7 @@ async def search_techniques(
               "name": "<technique name>",
               "stix_id": "<attack-pattern--...>",
               "description": "<description or null>",
+              "domain": "<enterprise|mobile|ics>"  # included when domain="all"
             },
             ...
           ],
@@ -2061,6 +2394,16 @@ async def search_techniques(
           "message": "<status summary>"
         }
     """
+    norm_domain = (domain or "enterprise").strip().lower()
+    if norm_domain == "all":
+        return _search_techniques_all_domains(
+            query=query,
+            include_description=include_description,
+            limit=limit,
+            offset=offset,
+            include_formatted=include_formatted,
+        )
+
     attack_data = get_attack_data(domain)
     safe_limit, safe_offset = _validate_pagination(limit, offset)
 
