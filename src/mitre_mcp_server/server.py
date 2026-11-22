@@ -23,6 +23,24 @@ DOMAINS: List[str] = ["enterprise", "mobile", "ics"]
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 200
 
+PageLimit = Annotated[
+    int,
+    Field(
+        default=DEFAULT_PAGE_LIMIT,
+        ge=1,
+        le=MAX_PAGE_LIMIT,
+        description=f"Maximum number of items to return per page (1-{MAX_PAGE_LIMIT}).",
+    ),
+]
+PageOffset = Annotated[
+    int,
+    Field(
+        default=0,
+        ge=0,
+        description="Zero-based starting index for pagination (>= 0).",
+    ),
+]
+
 
 def _validate_pagination(limit: int, offset: int) -> Tuple[int, int]:
     """Validate pagination bounds (offset >= 0, 1 <= limit <= MAX_PAGE_LIMIT)."""
@@ -404,6 +422,222 @@ def _stix_get(obj: Any, attr: str, default: Any = None) -> Any:
     return getattr(obj, attr, default)
 
 
+def _get_aliases(obj: Any) -> List[str]:
+    """Extract aliases from a STIX object (supporting both aliases and x_mitre_aliases)."""
+    aliases = _stix_get(obj, "aliases") or _stix_get(obj, "x_mitre_aliases") or []
+    return list(aliases) if aliases else []
+
+
+def _extract_mitre_url(obj: Any) -> Optional[str]:
+    """Extract the primary MITRE ATT&CK external reference URL from a STIX object."""
+    refs = _stix_get(obj, "external_references") or []
+    for ref in refs:
+        src = ref.get("source_name") if isinstance(ref, dict) else getattr(ref, "source_name", None)
+        url = ref.get("url") if isinstance(ref, dict) else getattr(ref, "url", None)
+        if src in ("mitre-attack", "mitre-mobile-attack", "mitre-ics-attack") and url:
+            return url
+    for ref in refs:
+        url = ref.get("url") if isinstance(ref, dict) else getattr(ref, "url", None)
+        if url:
+            return url
+    return None
+
+
+def _extract_tactic_names(obj: Any) -> List[str]:
+    """Extract human-readable tactic names from a technique's kill_chain_phases."""
+    phases = _stix_get(obj, "kill_chain_phases") or []
+    tactics: List[str] = []
+    for p in phases:
+        phase_name = p.get("phase_name") if isinstance(p, dict) else getattr(p, "phase_name", None)
+        if phase_name:
+            tactics.append(phase_name.replace("-", " ").title())
+    return tactics
+
+
+_ALL_RESOLVABLE_STIX_TYPES: Tuple[str, ...] = (
+    "attack-pattern",
+    "intrusion-set",
+    "malware",
+    "tool",
+    "course-of-action",
+    "campaign",
+    "x-mitre-data-component",
+    "x-mitre-data-source",
+    "x-mitre-asset",
+    "x-mitre-tactic",
+    "x-mitre-matrix",
+    "x-mitre-detection-strategy",
+    "x-mitre-analytic",
+)
+
+
+def _infer_stix_types_from_attack_id(raw: str) -> Tuple[str, ...]:
+    """Infer candidate STIX types from an ATT&CK external ID prefix."""
+    import re
+
+    upper = raw.upper()
+    lower = raw.lower()
+    if re.match(r"^T\d+(?:\.\d+)?$", upper):
+        return ("attack-pattern",)
+    if re.match(r"^TA\d+$", upper):
+        return ("x-mitre-tactic",)
+    if re.match(r"^G\d+$", upper):
+        return ("intrusion-set",)
+    if re.match(r"^S\d+$", upper):
+        return ("malware", "tool")
+    if re.match(r"^M\d+$", upper):
+        return ("course-of-action",)
+    if re.match(r"^C\d+$", upper):
+        return ("campaign",)
+    if re.match(r"^(?:DC|D)\d+$", upper):
+        return ("x-mitre-data-component",)
+    if re.match(r"^DS\d+$", upper):
+        return ("x-mitre-data-source",)
+    if re.match(r"^A\d+$", upper):
+        return ("x-mitre-asset",)
+    if re.match(r"^DET\d+$", upper):
+        return ("x-mitre-detection-strategy",)
+    if re.match(r"^AN\d+$", upper):
+        return ("x-mitre-analytic",)
+    if lower in (
+        "enterprise",
+        "mobile",
+        "ics",
+        "enterprise-attack",
+        "mobile-attack",
+        "ics-attack",
+    ) or "att&ck" in lower:
+        return ("x-mitre-matrix",)
+    return _ALL_RESOLVABLE_STIX_TYPES
+
+
+def _resolve_stix_object(
+    identifier: str,
+    domain: str = "enterprise",
+    expected_stix_type: Optional[Any] = None,
+) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
+    """Resolve either a STIX ID or an ATT&CK ID to (stix_id, stix_obj, error_message).
+
+    Accepts STIX UUIDs (e.g., 'attack-pattern--...', 'intrusion-set--...') as well as
+    ATT&CK external IDs (e.g., 'T1190', 'T1566.002', 'G0016', 'S0154', 'M1051',
+    'C0024', 'DC0032', 'A0003', 'enterprise-attack').
+    """
+    raw = (identifier or "").strip()
+    dom = (domain or "enterprise").strip().lower()
+    if not raw:
+        return None, None, f"Empty identifier provided for domain '{dom}'."
+
+    expected_types: Optional[Tuple[str, ...]] = None
+    if isinstance(expected_stix_type, str) and expected_stix_type.strip():
+        expected_types = (expected_stix_type.strip().lower(),)
+    elif isinstance(expected_stix_type, (tuple, list, set)):
+        cleaned = tuple(str(t).strip().lower() for t in expected_stix_type if str(t).strip())
+        if cleaned:
+            expected_types = cleaned
+
+    ad = get_attack_data(dom)
+
+    # 1. STIX ID path (contains "--")
+    if "--" in raw:
+        obj = None
+        for candidate in (raw, raw.lower()):
+            try:
+                obj = ad.get_object_by_stix_id(candidate)
+            except Exception:
+                obj = None
+            if obj is not None:
+                break
+        if obj is None:
+            return None, None, f"STIX ID '{raw}' was not found in domain '{dom}'."
+        obj = _unwrap_stix_object(obj)
+        resolved_id = _stix_get(obj, "id") or raw.lower()
+        actual_type = (_stix_get(obj, "type") or "").lower()
+        if expected_types and actual_type and actual_type not in expected_types:
+            return (
+                None,
+                None,
+                f"Identifier '{raw}' resolved to STIX type '{actual_type}', "
+                f"expected {', '.join(expected_types)} in domain '{dom}'.",
+            )
+        return resolved_id, obj, None
+
+    # 2. ATT&CK ID / matrix name path
+    candidate_types = expected_types or _infer_stix_types_from_attack_id(raw)
+    raw_upper = raw.upper()
+    raw_lower = raw.lower()
+
+    # Special matrix resolution (e.g., 'enterprise-attack', 'enterprise', 'Enterprise ATT&CK')
+    if "x-mitre-matrix" in candidate_types:
+        try:
+            matrices = ad.get_matrices(remove_revoked_deprecated=False) or []
+        except Exception:
+            matrices = []
+        for m in matrices:
+            m_obj = _unwrap_stix_object(m)
+            m_id = _stix_get(m_obj, "id")
+            m_name = (_stix_get(m_obj, "name") or "").strip().lower()
+            try:
+                m_aid = (ad.get_attack_id(m_id) or "").strip().lower() if m_id else ""
+            except Exception:
+                m_aid = ""
+            if raw_lower in {m_aid, m_name, m_aid.removesuffix("-attack")} and m_id:
+                return m_id, m_obj, None
+
+    # Standard ATT&CK ID lookup via MitreAttackData
+    for stix_type in candidate_types:
+        for candidate_id in (raw_upper, raw):
+            try:
+                obj = ad.get_object_by_attack_id(candidate_id, stix_type)
+            except Exception:
+                obj = None
+            if obj is not None:
+                obj = _unwrap_stix_object(obj)
+                resolved_id = _stix_get(obj, "id")
+                if resolved_id:
+                    return resolved_id, obj, None
+
+    # Fallback scan over external_references for types not indexed by get_object_by_attack_id
+    for stix_type in candidate_types:
+        try:
+            objs = ad.get_objects_by_type(stix_type, remove_revoked_deprecated=False) or []
+        except Exception:
+            objs = []
+        for item in objs:
+            obj = _unwrap_stix_object(item)
+            refs = _stix_get(obj, "external_references") or []
+            for ref in refs:
+                ext_id = (
+                    ref.get("external_id")
+                    if isinstance(ref, dict)
+                    else getattr(ref, "external_id", None)
+                )
+                if ext_id and str(ext_id).strip().lower() == raw_lower:
+                    resolved_id = _stix_get(obj, "id")
+                    if resolved_id:
+                        return resolved_id, obj, None
+
+    expected_desc = (
+        "/".join(expected_types) if expected_types else "ATT&CK object"
+    )
+    return (
+        None,
+        None,
+        f"Identifier '{raw}' could not be resolved to a valid {expected_desc} in domain '{dom}'.",
+    )
+
+
+def resolve_stix_id(
+    identifier: str,
+    domain: str = "enterprise",
+    expected_stix_type: Optional[Any] = None,
+) -> Optional[str]:
+    """Resolve a STIX ID or ATT&CK ID to its canonical STIX ID, or None if unresolvable."""
+    stix_id, _, _ = _resolve_stix_object(
+        identifier, domain=domain, expected_stix_type=expected_stix_type
+    )
+    return stix_id
+
+
 def _normalize_tactic_shortname(attack_data: Any, tactic: str) -> str:
     """Resolve a tactic name, ATT&CK ID, or shortname to its x_mitre_shortname."""
     raw = (tactic or "").strip()
@@ -696,9 +930,9 @@ async def get_technique_by_id(
     technique_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
     ) -> Dict[str, Any]:
-
-    """" 
+    """
     Retrieve a MITRE ATT&CK technique by its external ATT&CK ID (e.g., "T1055", "T1053.005").
 
     This tool searches the specified ATT&CK domain (enterprise, mobile, or ics)
@@ -710,6 +944,7 @@ async def get_technique_by_id(
         technique_id: The external ATT&CK technique ID (e.g., "T1055").
         domain: ATT&CK domain to search in ("enterprise", "mobile", "ics").
         include_description: If True, returns the full ATT&CK description text.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
@@ -718,6 +953,14 @@ async def get_technique_by_id(
               "id": "<ATT&CK ID>",
               "name": "<technique name>",
               "stix_id": "<STIX object ID>",
+              "platforms": [...],
+              "tactics": [...],
+              "is_subtechnique": bool,
+              "mitre_url": "<URL or null>",
+              "modified": "<ISO8601 timestamp or null>",
+              "revoked": bool,
+              "deprecated": bool,
+              "revoked_by": {...} | null,
               "description": "<full description or null>"
           },
           "formatted": "<human-readable formatted block>",
@@ -744,11 +987,21 @@ async def get_technique_by_id(
     is_revoked = bool(_stix_get(tech, "revoked", False))
     is_deprecated = bool(_stix_get(tech, "x_mitre_deprecated", False))
     revoked_by = _resolve_revoked_by(attack_data, stix_id) if is_revoked else None
+    platforms = list(_stix_get(tech, "x_mitre_platforms") or [])
+    tactics = _extract_tactic_names(tech)
+    is_subtechnique = bool(_stix_get(tech, "x_mitre_is_subtechnique", False))
+    mitre_url = _extract_mitre_url(tech)
+    modified_val = _stix_get(tech, "modified")
+    modified = str(modified_val) if modified_val is not None else None
 
-    formatted = format_objects(
-        [tech],
-        include_description=include_description,
-        domain=domain
+    formatted = (
+        format_objects(
+            [tech],
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     msg = f"Found technique '{norm_id}' ({_stix_get(tech, 'name')}) in domain '{domain}'."
@@ -766,6 +1019,11 @@ async def get_technique_by_id(
             "id": norm_id,
             "name": _stix_get(tech, "name"),
             "stix_id": stix_id,
+            "platforms": platforms,
+            "tactics": tactics,
+            "is_subtechnique": is_subtechnique,
+            "mitre_url": mitre_url,
+            "modified": modified,
             "revoked": is_revoked,
             "deprecated": is_deprecated,
             "revoked_by": revoked_by,
@@ -1077,10 +1335,13 @@ async def get_objects_by_name(
 @mcp.tool()
 async def get_objects_by_content(
     content: str,
-    object_type: str,
+    object_type: str = "all",
     domain: str = "enterprise",
     include_description: bool = True,
     remove_revoked_deprecated: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Search MITRE ATT&CK objects by matching text inside their description field.
@@ -1089,27 +1350,40 @@ async def get_objects_by_content(
       • Finding techniques related to specific technologies (e.g., “PowerShell”)
       • Finding groups mentioning a region or country (e.g., “Russia”)
       • Finding mitigations referencing specific defenses (e.g., “multi-factor”)
-      • Searching malware or tool descriptions for keywords
+      • Searching malware, tools, or procedure examples (relationships) for CVE IDs
+        (e.g., "CVE-2021-44228") using object_type="all" or object_type="relationship"
 
     Args:
         content: The text to search for (case-insensitive, partial match).
-        object_type: STIX object type, such as:
+        object_type: STIX object type, or "all" to search across all object types
+            including relationships (procedure examples):
+            - "all" (cross-type search including techniques, groups, software, relationships)
+            - "relationship" (procedure examples, useful for CVE searches)
             - "attack-pattern" (techniques)
             - "intrusion-set" (APT groups)
             - "malware"
             - "tool"
             - "course-of-action" (mitigations)
             - "campaign"
-            - "x-mitre-data-source"
+            - "x-mitre-detection-strategy"
+            - "x-mitre-analytic"
             - "x-mitre-data-component"
             - etc.
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to return descriptions in the structured output.
         remove_revoked_deprecated: Whether to exclude revoked and deprecated objects (default: True).
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
-          "count": <number of matches>,
+          "count": <number of matches in this page>,
+          "total_count": <total number of matches>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "objects": [
              {
                 "attack_id": "<ATT&CK ID or null>",
@@ -1125,12 +1399,18 @@ async def get_objects_by_content(
         }
     """
     attack_data = get_attack_data(domain)
-    norm_type = (object_type or "").strip().lower()
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
+    norm_type = (object_type or "all").strip().lower()
     content_clean = (content or "").strip()
 
     if not content_clean:
         return {
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "objects": [],
             "formatted": "",
             "message": (
@@ -1140,18 +1420,62 @@ async def get_objects_by_content(
         }
 
     # Perform text search
-    try:
-        objs = attack_data.get_objects_by_content(
-            content_clean,
-            norm_type,
-            remove_revoked_deprecated=remove_revoked_deprecated,
-        )
-    except Exception:
-        objs = []
+    content_lower = content_clean.lower()
+    objs: List[Any] = []
+    if norm_type == "all":
+        search_types = _ALL_RESOLVABLE_STIX_TYPES + ("relationship",)
+        seen_ids: set[str] = set()
+        for st in search_types:
+            try:
+                candidates = attack_data.get_objects_by_type(
+                    st, remove_revoked_deprecated=remove_revoked_deprecated
+                ) or []
+            except Exception:
+                candidates = []
+            for item in candidates:
+                obj = _unwrap_stix_object(item)
+                if obj is None:
+                    continue
+                sid = _stix_get(obj, "id")
+                if sid and sid in seen_ids:
+                    continue
+                desc = _stix_get(obj, "description") or ""
+                if content_lower in str(desc).lower():
+                    if sid:
+                        seen_ids.add(sid)
+                    objs.append(obj)
+    elif norm_type == "relationship":
+        try:
+            candidates = attack_data.get_objects_by_type(
+                "relationship", remove_revoked_deprecated=remove_revoked_deprecated
+            ) or []
+        except Exception:
+            candidates = []
+        for item in candidates:
+            obj = _unwrap_stix_object(item)
+            if obj is None:
+                continue
+            desc = _stix_get(obj, "description") or ""
+            if content_lower in str(desc).lower():
+                objs.append(obj)
+    else:
+        try:
+            objs = attack_data.get_objects_by_content(
+                content_clean,
+                norm_type,
+                remove_revoked_deprecated=remove_revoked_deprecated,
+            ) or []
+        except Exception:
+            objs = []
 
     if not objs:
         return {
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "objects": [],
             "formatted": "",
             "message": (
@@ -1159,51 +1483,92 @@ async def get_objects_by_content(
             ),
         }
 
+    objs_sorted = sorted(
+        objs,
+        key=lambda o: (
+            str(_stix_get(o, "type") or ""),
+            str(_stix_get(o, "name") or ""),
+            str(_stix_get(o, "id") or ""),
+        ),
+    )
+    page_objs, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        objs_sorted, limit=limit, offset=offset
+    )
+
     structured: List[Dict[str, Any]] = []
 
-    for obj in objs:
-        # Handle STIX objects that may be dict-like or class-like
-        if isinstance(obj, dict):
-            name = obj.get("name")
-            stix_id = obj.get("id")
-            stix_type = obj.get("type", object_type)
-            description = obj.get("description") if include_description else None
-        else:
-            name = getattr(obj, "name", None)
-            stix_id = getattr(obj, "id", None)
-            stix_type = getattr(obj, "type", object_type)
-            description = getattr(obj, "description", None) if include_description else None
+    for obj in page_objs:
+        name = _stix_get(obj, "name")
+        stix_id = _stix_get(obj, "id")
+        stix_type = _stix_get(obj, "type", object_type)
+        description = _stix_get(obj, "description") if include_description else None
 
         # Resolve external ATT&CK ID, if present
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
-        structured.append(
-            {
-                "attack_id": attack_id,
-                "name": name,
-                "stix_id": stix_id,
-                "type": stix_type,
-                "description": description,
-            }
-        )
+        entry: Dict[str, Any] = {
+            "attack_id": attack_id,
+            "name": name,
+            "stix_id": stix_id,
+            "type": stix_type,
+            "description": description,
+        }
+
+        if stix_type == "relationship":
+            src_ref = _stix_get(obj, "source_ref")
+            tgt_ref = _stix_get(obj, "target_ref")
+            rel_type = _stix_get(obj, "relationship_type")
+            entry["relationship_type"] = rel_type
+            entry["source_ref"] = src_ref
+            entry["target_ref"] = tgt_ref
+            for ref_key, ref_id in (("source", src_ref), ("target", tgt_ref)):
+                ref_name = None
+                ref_aid = None
+                ref_type = ref_id.split("--")[0] if isinstance(ref_id, str) and "--" in ref_id else None
+                if ref_id:
+                    try:
+                        ref_obj = attack_data.get_object_by_stix_id(ref_id)
+                        if ref_obj is not None:
+                            ref_name = _stix_get(ref_obj, "name")
+                            ref_type = _stix_get(ref_obj, "type") or ref_type
+                        ref_aid = attack_data.get_attack_id(ref_id)
+                    except Exception:
+                        pass
+                entry[ref_key] = {
+                    "attack_id": ref_aid,
+                    "name": ref_name,
+                    "stix_id": ref_id,
+                    "type": ref_type,
+                }
+
+        structured.append(entry)
 
     # Human-readable output using your formatter
-    formatted = format_objects(
-        objs,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_objs,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "objects": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} '{object_type}' objects whose descriptions "
-            f"contain the text '{content}'."
+            f"Found {total_count} '{object_type}' objects whose descriptions "
+            f"contain the text '{content}' (returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -1212,6 +1577,9 @@ async def get_techniques_by_tactic(
     tactic: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all techniques associated with a specific ATT&CK tactic.
@@ -1221,18 +1589,27 @@ async def get_techniques_by_tactic(
 
     Examples:
         - get_techniques_by_tactic("Initial Access", "enterprise")
-        - get_techniques_by_tactic("Execution", "enterprise")
+        - get_techniques_by_tactic("Stealth", "enterprise")
+        - get_techniques_by_tactic("Defense Impairment", "enterprise")
         - get_techniques_by_tactic("Persistence", "enterprise")
 
     Args:
-        tactic: Tactic name (e.g., "Initial Access", "Persistence").
+        tactic: Tactic name (e.g., "Initial Access", "Stealth", "Defense Impairment", "Persistence").
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include technique descriptions
                              in the structured and formatted output.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
-          "count": <number of techniques>,
+          "count": <number of techniques in this page>,
+          "total_count": <total number of techniques>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "techniques": [
             {
               "attack_id": "<TXXXX or TXXXX.YYY>",
@@ -1248,6 +1625,7 @@ async def get_techniques_by_tactic(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
     tactic_shortname = _normalize_tactic_shortname(attack_data, tactic)
     canonical_tactic = tactic
@@ -1276,6 +1654,11 @@ async def get_techniques_by_tactic(
         msg = f"No techniques found for tactic '{canonical_tactic}' in domain '{domain}'."
         resp: Dict[str, Any] = {
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": f"{msg} {legacy['hint']}" if legacy else msg,
@@ -1284,18 +1667,23 @@ async def get_techniques_by_tactic(
             resp["suggested_tactics"] = legacy["suggested_tactics"]
         return resp
 
+    techniques_sorted = sorted(
+        techniques,
+        key=lambda t: (
+            str(_stix_get(t, "name") or ""),
+            str(_stix_get(t, "id") or ""),
+        ),
+    )
+    page_techniques, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        techniques_sorted, limit=limit, offset=offset
+    )
+
     structured: List[Dict[str, Any]] = []
 
-    for tech in techniques:
-        # Handle dict-like vs object-like STIX representations
-        if isinstance(tech, dict):
-            name = tech.get("name")
-            stix_id = tech.get("id")
-            description = tech.get("description") if include_description else None
-        else:
-            name = getattr(tech, "name", None)
-            stix_id = getattr(tech, "id", None)
-            description = getattr(tech, "description", None) if include_description else None
+    for tech in page_techniques:
+        name = _stix_get(tech, "name")
+        stix_id = _stix_get(tech, "id")
+        description = _stix_get(tech, "description") if include_description else None
 
         # Resolve external ATT&CK ID (Txxxx / Txxxx.yyy)
         attack_id = None
@@ -1315,19 +1703,28 @@ async def get_techniques_by_tactic(
             }
         )
 
-    formatted = format_objects(
-        techniques,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_techniques,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "techniques": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} technique(s) for tactic '{canonical_tactic}' "
-            f"in domain '{domain}'."
+            f"Found {total_count} technique(s) for tactic '{canonical_tactic}' "
+            f"in domain '{domain}' (returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -1336,6 +1733,9 @@ async def search_techniques(
     query: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Search MITRE ATT&CK techniques by keyword in their name or description.
@@ -1356,10 +1756,18 @@ async def search_techniques(
         domain: ATT&CK domain ("enterprise", "mobile", or "ics").
         include_description: Whether to include descriptions in the structured
                              result and formatted output.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
-          "count": <number of matches>,
+          "count": <number of matches in this page>,
+          "total_count": <total number of matches>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "techniques": [
             {
               "attack_id": "<TXXXX or TXXXX.YYY>",
@@ -1374,11 +1782,17 @@ async def search_techniques(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
     query_lower = (query or "").strip().lower()
     if not query_lower:
         return {
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": (
@@ -1394,13 +1808,8 @@ async def search_techniques(
     matched: List[Any] = []
 
     for tech in all_techniques:
-        # Handle dict-like vs object-like STIX representations
-        if isinstance(tech, dict):
-            name = tech.get("name") or ""
-            description = tech.get("description") or ""
-        else:
-            name = getattr(tech, "name", "") or ""
-            description = getattr(tech, "description", "") or ""
+        name = (_stix_get(tech, "name") or "")
+        description = (_stix_get(tech, "description") or "")
 
         if query_lower in name.lower() or query_lower in description.lower():
             matched.append(tech)
@@ -1408,6 +1817,11 @@ async def search_techniques(
     if not matched:
         return {
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": (
@@ -1415,17 +1829,23 @@ async def search_techniques(
             ),
         }
 
+    matched_sorted = sorted(
+        matched,
+        key=lambda t: (
+            str(_stix_get(t, "name") or ""),
+            str(_stix_get(t, "id") or ""),
+        ),
+    )
+    page_matched, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        matched_sorted, limit=limit, offset=offset
+    )
+
     structured: List[Dict[str, Any]] = []
 
-    for tech in matched:
-        if isinstance(tech, dict):
-            name = tech.get("name")
-            stix_id = tech.get("id")
-            description = tech.get("description") if include_description else None
-        else:
-            name = getattr(tech, "name", None)
-            stix_id = getattr(tech, "id", None)
-            description = getattr(tech, "description", None) if include_description else None
+    for tech in page_matched:
+        name = _stix_get(tech, "name")
+        stix_id = _stix_get(tech, "id")
+        description = _stix_get(tech, "description") if include_description else None
 
         # Resolve ATT&CK external ID
         attack_id = None
@@ -1444,19 +1864,28 @@ async def search_techniques(
             }
         )
 
-    formatted = format_objects(
-        matched,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_matched,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "techniques": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} technique(s) in domain '{domain}' "
-            f"matching query '{query}'."
+            f"Found {total_count} technique(s) in domain '{domain}' "
+            f"matching query '{query}' (returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -1647,6 +2076,9 @@ async def search_groups(
     query: str = "",
     domain: str = "enterprise",
     include_description: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Search MITRE ATT&CK intrusion sets (APT groups) by name, alias, or
@@ -1658,10 +2090,18 @@ async def search_groups(
         query: Search keyword (name, alias, or any text in the description).
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include descriptions in the output.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
-          "count": <number of matches>,
+          "count": <number of matches in this page>,
+          "total_count": <total number of matches>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "groups": [
             {
               "attack_id": "GXXXX",
@@ -1677,6 +2117,7 @@ async def search_groups(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
     try:
         groups = attack_data.get_groups(remove_revoked_deprecated=True)
@@ -1684,19 +2125,13 @@ async def search_groups(
         groups = []
 
     # Empty query → return all groups
-    query_lower = query.lower().strip()
+    query_lower = (query or "").lower().strip()
     matched = []
 
     for grp in groups:
-        # extract fields safely
-        if isinstance(grp, dict):
-            name = grp.get("name", "").lower()
-            description = grp.get("description", "").lower()
-            aliases = [a.lower() for a in grp.get("aliases", [])]
-        else:
-            name = getattr(grp, "name", "").lower()
-            description = getattr(grp, "description", "").lower()
-            aliases = [a.lower() for a in getattr(grp, "aliases", [])]
+        name = (_stix_get(grp, "name") or "").lower()
+        description = (_stix_get(grp, "description") or "").lower()
+        aliases = [a.lower() for a in _get_aliases(grp)]
 
         if not query_lower:
             matched.append(grp)
@@ -1713,28 +2148,38 @@ async def search_groups(
     if not matched:
         return {
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "groups": [],
             "formatted": "",
             "message": f"No APT groups in domain '{domain}' matched query '{query}'.",
         }
 
+    matched_sorted = sorted(
+        matched,
+        key=lambda g: (
+            str(_stix_get(g, "name") or ""),
+            str(_stix_get(g, "id") or ""),
+        ),
+    )
+    page_matched, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        matched_sorted, limit=limit, offset=offset
+    )
+
     # Build structured output
     response_groups = []
-    for grp in matched:
-        if isinstance(grp, dict):
-            name = grp.get("name")
-            stix_id = grp.get("id")
-            aliases = grp.get("aliases", [])
-            description = grp.get("description") if include_description else None
-        else:
-            name = getattr(grp, "name", None)
-            stix_id = getattr(grp, "id", None)
-            aliases = getattr(grp, "aliases", [])
-            description = getattr(grp, "description", None) if include_description else None
+    for grp in page_matched:
+        name = _stix_get(grp, "name")
+        stix_id = _stix_get(grp, "id")
+        aliases = _get_aliases(grp)
+        description = _stix_get(grp, "description") if include_description else None
 
         # Resolve ATT&CK external ID (e.g., G0016)
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
@@ -1748,19 +2193,28 @@ async def search_groups(
             }
         )
 
-    formatted = format_objects(
-        matched,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_matched,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "count": len(response_groups),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "groups": response_groups,
         "formatted": formatted,
         "message": (
-            f"Found {len(response_groups)} APT group(s) in domain '{domain}' "
-            f"matching query '{query}'."
+            f"Found {total_count} APT group(s) in domain '{domain}' "
+            f"matching query '{query}' (returning {len(response_groups)} at offset {safe_offset})."
         ),
     }
 
@@ -1957,6 +2411,9 @@ async def get_group_techniques(
 async def get_software(
     domain: str = "enterprise",
     include_description: bool = False,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all software (malware and tools) in a given ATT&CK domain.
@@ -1968,14 +2425,23 @@ async def get_software(
         domain: ATT&CK domain to search ("enterprise", "mobile", or "ics").
         include_description: Whether to include descriptions in the output and
                              formatted text.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
-          "count": <number of software objects>,
+          "count": <number of software objects in this page>,
+          "total_count": <total number of software objects>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "software": [
             {
               "attack_id": "<SXXXX or similar, if present>",
               "name": "<software name>",
+              "aliases": [...],
               "stix_id": "<STIX ID>",
               "type": "<malware|tool|...>",
               "description": "<text or null>"
@@ -1987,6 +2453,7 @@ async def get_software(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
     try:
         software_objs = attack_data.get_software(remove_revoked_deprecated=True)
@@ -1996,24 +2463,35 @@ async def get_software(
     if not software_objs:
         return {
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "software": [],
             "formatted": "",
             "message": f"No software objects found in domain '{domain}'.",
         }
 
+    software_sorted = sorted(
+        software_objs,
+        key=lambda o: (
+            str(_stix_get(o, "name") or ""),
+            str(_stix_get(o, "id") or ""),
+        ),
+    )
+    page_software, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        software_sorted, limit=limit, offset=offset
+    )
+
     software_list: List[Dict[str, Any]] = []
 
-    for obj in software_objs:
-        if isinstance(obj, dict):
-            name = obj.get("name")
-            stix_id = obj.get("id")
-            stix_type = obj.get("type")
-            description = obj.get("description") if include_description else None
-        else:
-            name = getattr(obj, "name", None)
-            stix_id = getattr(obj, "id", None)
-            stix_type = getattr(obj, "type", None)
-            description = getattr(obj, "description", None) if include_description else None
+    for obj in page_software:
+        name = _stix_get(obj, "name")
+        stix_id = _stix_get(obj, "id")
+        stix_type = _stix_get(obj, "type")
+        aliases = _get_aliases(obj)
+        description = _stix_get(obj, "description") if include_description else None
 
         # External ATT&CK ID (e.g., SXXXX)
         attack_id = None
@@ -2027,25 +2505,35 @@ async def get_software(
             {
                 "attack_id": attack_id,
                 "name": name,
+                "aliases": aliases,
                 "stix_id": stix_id,
                 "type": stix_type,
                 "description": description,
             }
         )
 
-    formatted = format_objects(
-        software_objs,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_software,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "count": len(software_list),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "software": software_list,
         "formatted": formatted,
         "message": (
-            f"Found {len(software_list)} software object(s) "
-            f"in domain '{domain}'."
+            f"Found {total_count} software object(s) "
+            f"in domain '{domain}' (returning {len(software_list)} at offset {safe_offset})."
         ),
     }
 
@@ -2054,6 +2542,9 @@ async def search_software(
     query: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Search MITRE ATT&CK software (malware & tools) by keyword in name or
@@ -2063,14 +2554,23 @@ async def search_software(
         query: Keyword to search for in software names and descriptions.
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include descriptions in the response.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
-          "count": <number of matches>,
+          "count": <number of matches in this page>,
+          "total_count": <total number of matches>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "software": [
             {
               "attack_id": "<SXXXX or similar>",
               "name": "...",
+              "aliases": [...],
               "stix_id": "...",
               "type": "<tool|malware|...>",
               "description": "..." | null
@@ -2082,6 +2582,7 @@ async def search_software(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
     # Load all software objects
     try:
@@ -2092,6 +2593,11 @@ async def search_software(
     if not all_sw:
         return {
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "software": [],
             "formatted": "",
             "message": f"No software found in domain '{domain}'.",
@@ -2101,6 +2607,11 @@ async def search_software(
     if not query_lower:
         return {
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "software": [],
             "formatted": "",
             "message": (
@@ -2112,12 +2623,8 @@ async def search_software(
 
     # Software search loop
     for sw in all_sw:
-        if isinstance(sw, dict):
-            name = (sw.get("name") or "").lower()
-            description = (sw.get("description") or "").lower()
-        else:
-            name = (getattr(sw, "name", "") or "").lower()
-            description = (getattr(sw, "description", "") or "").lower()
+        name = (_stix_get(sw, "name") or "").lower()
+        description = (_stix_get(sw, "description") or "").lower()
 
         if query_lower in name or query_lower in description:
             matched.append(sw)
@@ -2125,6 +2632,11 @@ async def search_software(
     if not matched:
         return {
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "software": [],
             "formatted": "",
             "message": (
@@ -2132,24 +2644,30 @@ async def search_software(
             ),
         }
 
+    matched_sorted = sorted(
+        matched,
+        key=lambda o: (
+            str(_stix_get(o, "name") or ""),
+            str(_stix_get(o, "id") or ""),
+        ),
+    )
+    page_matched, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        matched_sorted, limit=limit, offset=offset
+    )
+
     # Build structured output
     structured = []
 
-    for sw in matched:
-        if isinstance(sw, dict):
-            name = sw.get("name")
-            stix_id = sw.get("id")
-            sw_type = sw.get("type")
-            desc = sw.get("description") if include_description else None
-        else:
-            name = getattr(sw, "name", None)
-            stix_id = getattr(sw, "id", None)
-            sw_type = getattr(sw, "type", None)
-            desc = getattr(sw, "description", None) if include_description else None
+    for sw in page_matched:
+        name = _stix_get(sw, "name")
+        stix_id = _stix_get(sw, "id")
+        sw_type = _stix_get(sw, "type")
+        aliases = _get_aliases(sw)
+        desc = _stix_get(sw, "description") if include_description else None
 
         # ATT&CK external ID (SXXXX)
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
@@ -2157,25 +2675,35 @@ async def search_software(
             {
                 "attack_id": attack_id,
                 "name": name,
+                "aliases": aliases,
                 "stix_id": stix_id,
                 "type": sw_type,
                 "description": desc,
             }
         )
 
-    formatted = format_objects(
-        matched,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_matched,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "software": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} software object(s) in domain '{domain}' "
-            f"matching '{query}'."
+            f"Found {total_count} software object(s) in domain '{domain}' "
+            f"matching '{query}' (returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -2593,21 +3121,23 @@ async def get_techniques_used_by_group(
     group_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
-    Get all techniques used by a specific APT group, identified by its STIX ID.
+    Get all techniques used by a specific APT group, identified by its STIX ID or ATT&CK ID.
 
-    This is similar to `get_group_techniques`, but instead of a group name or
-    alias it takes the group's STIX UUID (e.g. "intrusion-set--..."), which is
-    useful when you already have the STIX ID from another query or relationship.
+    This is similar to `get_group_techniques`, and accepts either the group's STIX UUID
+    (e.g. "intrusion-set--...") or its ATT&CK ID (e.g. "G0016").
 
     Args:
-        group_stix_id: STIX ID of the group (intrusion-set--UUID).
+        group_stix_id: STIX ID (intrusion-set--UUID) or ATT&CK ID (e.g., "G0016") of the group.
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include technique descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "group": {
               "attack_id": "GXXXX" | null,
               "name": "<group name or null>",
@@ -2640,21 +3170,24 @@ async def get_techniques_used_by_group(
     """
     attack_data = get_attack_data(domain)
 
-    # Try to resolve basic group info from its STIX ID (optional but useful)
-    try:
-        grp_obj = attack_data.get_object_by_stix_id(group_stix_id)
-    except Exception:
-        grp_obj = None
+    resolved_id, grp_obj, err = _resolve_stix_object(
+        group_stix_id, domain=domain, expected_stix_type="intrusion-set"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "group": None,
+            "count": 0,
+            "techniques": [],
+            "formatted": "",
+            "message": err or f"Group '{group_stix_id}' not found in domain '{domain}'.",
+        }
+    group_stix_id = resolved_id
 
     group_info: Optional[Dict[str, Any]] = None
     if grp_obj is not None:
-        if isinstance(grp_obj, dict):
-            g_name = grp_obj.get("name")
-            g_desc = grp_obj.get("description") if include_description else None
-        else:
-            g_name = getattr(grp_obj, "name", None)
-            g_desc = getattr(grp_obj, "description", None) if include_description else None
-
+        g_name = _stix_get(grp_obj, "name")
+        g_desc = _stix_get(grp_obj, "description") if include_description else None
         try:
             g_attack_id = attack_data.get_attack_id(group_stix_id)
         except Exception:
@@ -2675,6 +3208,7 @@ async def get_techniques_used_by_group(
 
     if not rel_entries:
         return {
+            "found": True,
             "group": group_info,
             "count": 0,
             "techniques": [],
@@ -2704,22 +3238,15 @@ async def get_techniques_used_by_group(
 
         technique_objects_for_format.append(tech_obj)
 
-        # Technique fields
-        if isinstance(tech_obj, dict):
-            t_name = tech_obj.get("name")
-            t_stix_id = tech_obj.get("id")
-            t_desc = tech_obj.get("description") if include_description else None
-        else:
-            t_name = getattr(tech_obj, "name", None)
-            t_stix_id = getattr(tech_obj, "id", None)
-            t_desc = getattr(tech_obj, "description", None) if include_description else None
+        t_name = _stix_get(tech_obj, "name")
+        t_stix_id = _stix_get(tech_obj, "id")
+        t_desc = _stix_get(tech_obj, "description") if include_description else None
 
         try:
-            t_attack_id = attack_data.get_attack_id(t_stix_id)
+            t_attack_id = attack_data.get_attack_id(t_stix_id) if t_stix_id else None
         except Exception:
             t_attack_id = None
 
-        # Relationship info
         relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         techniques_structured.append(
@@ -2733,7 +3260,7 @@ async def get_techniques_used_by_group(
         )
 
     formatted = ""
-    if technique_objects_for_format:
+    if include_formatted and technique_objects_for_format:
         formatted = format_objects(
             technique_objects_for_format,
             include_description=include_description,
@@ -2741,6 +3268,7 @@ async def get_techniques_used_by_group(
         )
 
     return {
+        "found": True,
         "group": group_info,
         "count": len(techniques_structured),
         "techniques": techniques_structured,
@@ -2756,21 +3284,24 @@ async def get_software_used_by_group(
     group_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all software (malware and tools) used by a specific APT group,
-    identified by its STIX ID.
+    identified by its STIX ID or ATT&CK ID (e.g., "G0016").
 
     This uses MITRE's `get_software_used_by_group` to follow 'uses'
     relationships from an intrusion set (group) to software objects.
 
     Args:
-        group_stix_id: STIX ID of the group (e.g., "intrusion-set--UUID").
+        group_stix_id: STIX ID (e.g., "intrusion-set--UUID") or ATT&CK ID (e.g., "G0016").
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include software descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "group": {
               "attack_id": "GXXXX" | null,
               "name": "<group name or null>",
@@ -2782,6 +3313,7 @@ async def get_software_used_by_group(
             {
               "attack_id": "SXXXX or similar" | null,
               "name": "<software name>",
+              "aliases": [...],
               "stix_id": "<STIX ID>",
               "type": "<malware|tool|...>",
               "description": "<text or null>",
@@ -2804,21 +3336,24 @@ async def get_software_used_by_group(
     """
     attack_data = get_attack_data(domain)
 
-    # Optional: resolve group info from its STIX ID
-    try:
-        grp_obj = attack_data.get_object_by_stix_id(group_stix_id)
-    except Exception:
-        grp_obj = None
+    resolved_id, grp_obj, err = _resolve_stix_object(
+        group_stix_id, domain=domain, expected_stix_type="intrusion-set"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "group": None,
+            "count": 0,
+            "software": [],
+            "formatted": "",
+            "message": err or f"Group '{group_stix_id}' not found in domain '{domain}'.",
+        }
+    group_stix_id = resolved_id
 
     group_info: Optional[Dict[str, Any]] = None
     if grp_obj is not None:
-        if isinstance(grp_obj, dict):
-            g_name = grp_obj.get("name")
-            g_desc = grp_obj.get("description") if include_description else None
-        else:
-            g_name = getattr(grp_obj, "name", None)
-            g_desc = getattr(grp_obj, "description", None) if include_description else None
-
+        g_name = _stix_get(grp_obj, "name")
+        g_desc = _stix_get(grp_obj, "description") if include_description else None
         try:
             g_attack_id = attack_data.get_attack_id(group_stix_id)
         except Exception:
@@ -2839,6 +3374,7 @@ async def get_software_used_by_group(
 
     if not rel_entries:
         return {
+            "found": True,
             "group": group_info,
             "count": 0,
             "software": [],
@@ -2865,21 +3401,15 @@ async def get_software_used_by_group(
 
         software_objects_for_format.append(sw_obj)
 
-        # Extract software fields
-        if isinstance(sw_obj, dict):
-            s_name = sw_obj.get("name")
-            s_stix_id = sw_obj.get("id")
-            s_type = sw_obj.get("type")
-            s_desc = sw_obj.get("description") if include_description else None
-        else:
-            s_name = getattr(sw_obj, "name", None)
-            s_stix_id = getattr(sw_obj, "id", None)
-            s_type = getattr(sw_obj, "type", None)
-            s_desc = getattr(sw_obj, "description", None) if include_description else None
+        s_name = _stix_get(sw_obj, "name")
+        s_stix_id = _stix_get(sw_obj, "id")
+        s_type = _stix_get(sw_obj, "type")
+        s_aliases = _get_aliases(sw_obj)
+        s_desc = _stix_get(sw_obj, "description") if include_description else None
 
         # ATT&CK external ID (SXXXX, or sometimes none)
         try:
-            s_attack_id = attack_data.get_attack_id(s_stix_id)
+            s_attack_id = attack_data.get_attack_id(s_stix_id) if s_stix_id else None
         except Exception:
             s_attack_id = None
 
@@ -2889,6 +3419,7 @@ async def get_software_used_by_group(
             {
                 "attack_id": s_attack_id,
                 "name": s_name,
+                "aliases": s_aliases,
                 "stix_id": s_stix_id,
                 "type": s_type,
                 "description": s_desc,
@@ -2897,7 +3428,7 @@ async def get_software_used_by_group(
         )
 
     formatted = ""
-    if software_objects_for_format:
+    if include_formatted and software_objects_for_format:
         formatted = format_objects(
             software_objects_for_format,
             include_description=include_description,
@@ -2905,6 +3436,7 @@ async def get_software_used_by_group(
         )
 
     return {
+        "found": True,
         "group": group_info,
         "count": len(software_structured),
         "software": software_structured,
@@ -2925,21 +3457,24 @@ async def get_campaigns_attributed_to_group(
     group_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all campaigns attributed to a specific intrusion set (APT group),
-    identified by its STIX ID.
+    identified by its STIX ID or ATT&CK ID (e.g., "G0016").
 
     Campaigns represent specific operations or intrusion events attributed
     to a threat group.
 
     Args:
-        group_stix_id: STIX UUID of the group (e.g., "intrusion-set--UUID").
+        group_stix_id: STIX UUID (e.g., "intrusion-set--UUID") or ATT&CK ID (e.g., "G0016").
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include campaign descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "group": {
               "attack_id": "GXXXX" | null,
               "name": "<group name or null>",
@@ -2953,6 +3488,7 @@ async def get_campaigns_attributed_to_group(
             {
               "attack_id": "CXXXX" | null,
               "name": "<campaign name>",
+              "aliases": [...],
               "stix_id": "<campaign--UUID>",
               "description": "<text or null>"
             },
@@ -2965,21 +3501,24 @@ async def get_campaigns_attributed_to_group(
     """
     attack_data = get_attack_data(domain)
 
-    # Optional: resolve group details
-    try:
-        grp_obj = attack_data.get_object_by_stix_id(group_stix_id)
-    except Exception:
-        grp_obj = None
+    resolved_id, grp_obj, err = _resolve_stix_object(
+        group_stix_id, domain=domain, expected_stix_type="intrusion-set"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "group": None,
+            "count": 0,
+            "campaigns": [],
+            "formatted": "",
+            "message": err or f"Group '{group_stix_id}' not found in domain '{domain}'.",
+        }
+    group_stix_id = resolved_id
 
     group_info = None
     if grp_obj is not None:
-        if isinstance(grp_obj, dict):
-            g_name = grp_obj.get("name")
-            g_desc = grp_obj.get("description") if include_description else None
-        else:
-            g_name = getattr(grp_obj, "name", None)
-            g_desc = getattr(grp_obj, "description", None) if include_description else None
-
+        g_name = _stix_get(grp_obj, "name")
+        g_desc = _stix_get(grp_obj, "description") if include_description else None
         try:
             g_attack_id = attack_data.get_attack_id(group_stix_id)
         except Exception:
@@ -3000,6 +3539,7 @@ async def get_campaigns_attributed_to_group(
 
     if not campaign_entries:
         return {
+            "found": True,
             "group": group_info,
             "count": 0,
             "campaigns": [],
@@ -3019,7 +3559,7 @@ async def get_campaigns_attributed_to_group(
             continue
         name = _stix_get(c, "name")
         stix_id = _stix_get(c, "id")
-        aliases = _stix_get(c, "aliases") or _stix_get(c, "x_mitre_aliases") or []
+        aliases = _get_aliases(c)
         desc = _stix_get(c, "description") if include_description else None
 
         campaign_objects_for_format.append(c)
@@ -3039,13 +3579,18 @@ async def get_campaigns_attributed_to_group(
             }
         )
 
-    formatted = format_objects(
-        campaign_objects_for_format,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            campaign_objects_for_format,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
+        "found": True,
         "group": group_info,
         "count": len(structured_campaigns),
         "campaigns": structured_campaigns,
@@ -3176,6 +3721,7 @@ async def get_techniques_used_by_group_software(
     group_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get techniques used by the software that a group uses (Group → Software → Techniques).
@@ -3183,13 +3729,17 @@ async def get_techniques_used_by_group_software(
     This provides an indirect view of a group's capabilities by following:
         Group (intrusion set) → Software (malware/tools) → Techniques
 
+    Accepts either a STIX ID ("intrusion-set--UUID") or an ATT&CK ID (e.g., "G0016").
+
     Args:
-        group_stix_id: STIX ID of the group (e.g., "intrusion-set--UUID").
+        group_stix_id: STIX ID ("intrusion-set--UUID") or ATT&CK ID (e.g., "G0016").
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include technique descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "group": {
               "attack_id": "GXXXX" | null,
               "name": "<group name or null>",
@@ -3225,21 +3775,24 @@ async def get_techniques_used_by_group_software(
     """
     attack_data = get_attack_data(domain)
 
-    # Optional: resolve group details for context
-    try:
-        grp_obj = attack_data.get_object_by_stix_id(group_stix_id)
-    except Exception:
-        grp_obj = None
+    resolved_id, grp_obj, err = _resolve_stix_object(
+        group_stix_id, domain=domain, expected_stix_type="intrusion-set"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "group": None,
+            "count": 0,
+            "techniques": [],
+            "formatted": "",
+            "message": err or f"Group '{group_stix_id}' not found in domain '{domain}'.",
+        }
+    group_stix_id = resolved_id
 
     group_info: Optional[Dict[str, Any]] = None
     if grp_obj is not None:
-        if isinstance(grp_obj, dict):
-            g_name = grp_obj.get("name")
-            g_desc = grp_obj.get("description") if include_description else None
-        else:
-            g_name = getattr(grp_obj, "name", None)
-            g_desc = getattr(grp_obj, "description", None) if include_description else None
-
+        g_name = _stix_get(grp_obj, "name")
+        g_desc = _stix_get(grp_obj, "description") if include_description else None
         try:
             g_attack_id = attack_data.get_attack_id(group_stix_id)
         except Exception:
@@ -3399,6 +3952,7 @@ async def get_techniques_used_by_group_software(
 
     if not tech_by_id:
         return {
+            "found": True,
             "group": group_info,
             "count": 0,
             "techniques": [],
@@ -3453,7 +4007,7 @@ async def get_techniques_used_by_group_software(
         )
 
     formatted = ""
-    if technique_objects_for_format:
+    if include_formatted and technique_objects_for_format:
         formatted = format_objects(
             technique_objects_for_format,
             include_description=include_description,
@@ -3461,6 +4015,7 @@ async def get_techniques_used_by_group_software(
         )
 
     return {
+        "found": True,
         "group": group_info,
         "count": len(techniques_structured),
         "techniques": techniques_structured,
@@ -3476,21 +4031,23 @@ async def get_groups_using_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all APT groups (intrusion sets) that use a specific technique.
 
     This is a reverse lookup: Technique → Groups.
-    It follows 'uses' relationships from a technique STIX ID to intrusion sets.
+    Accepts either a STIX ID (e.g., "attack-pattern--UUID") or an ATT&CK ID (e.g., "T1190").
 
     Args:
-        technique_stix_id: STIX ID of the technique
-                           (e.g., "attack-pattern--UUID").
+        technique_stix_id: STIX ID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include group descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "technique": {
               "attack_id": "TXXXX or TXXXX.YYY" | null,
               "name": "<technique name or null>",
@@ -3527,21 +4084,24 @@ async def get_groups_using_technique(
     """
     attack_data = get_attack_data(domain)
 
-    # Optional: resolve technique metadata
-    try:
-        tech_obj = attack_data.get_object_by_stix_id(technique_stix_id)
-    except Exception:
-        tech_obj = None
+    resolved_id, tech_obj, err = _resolve_stix_object(
+        technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "technique": None,
+            "count": 0,
+            "groups": [],
+            "formatted": "",
+            "message": err or f"Technique '{technique_stix_id}' not found in domain '{domain}'.",
+        }
+    technique_stix_id = resolved_id
 
     technique_info: Optional[Dict[str, Any]] = None
     if tech_obj is not None:
-        if isinstance(tech_obj, dict):
-            t_name = tech_obj.get("name")
-            t_desc = tech_obj.get("description") if include_description else None
-        else:
-            t_name = getattr(tech_obj, "name", None)
-            t_desc = getattr(tech_obj, "description", None) if include_description else None
-
+        t_name = _stix_get(tech_obj, "name")
+        t_desc = _stix_get(tech_obj, "description") if include_description else None
         try:
             t_attack_id = attack_data.get_attack_id(technique_stix_id)
         except Exception:
@@ -3562,6 +4122,7 @@ async def get_groups_using_technique(
 
     if not rel_entries:
         return {
+            "found": True,
             "technique": technique_info,
             "count": 0,
             "groups": [],
@@ -3576,13 +4137,10 @@ async def get_groups_using_technique(
     group_objects_for_format: List[Any] = []
 
     for entry in rel_entries:
-        # Some APIs may return RelationshipEntry-like objects with .object/.relationships,
-        # others may return plain group objects. Handle both defensively.
         if isinstance(entry, dict) and ("object" in entry or "relationships" in entry):
             grp_obj = entry.get("object", entry)
             rels = entry.get("relationships", [])
         else:
-            # Could be an object with attributes or a bare dict group
             grp_obj = entry
             rels = []
 
@@ -3591,21 +4149,13 @@ async def get_groups_using_technique(
 
         group_objects_for_format.append(grp_obj)
 
-        # Extract group fields
-        if isinstance(grp_obj, dict):
-            g_name = grp_obj.get("name")
-            g_stix_id = grp_obj.get("id")
-            g_aliases = grp_obj.get("aliases", [])
-            g_desc = grp_obj.get("description") if include_description else None
-        else:
-            g_name = getattr(grp_obj, "name", None)
-            g_stix_id = getattr(grp_obj, "id", None)
-            g_aliases = getattr(grp_obj, "aliases", [])
-            g_desc = getattr(grp_obj, "description", None) if include_description else None
+        g_name = _stix_get(grp_obj, "name")
+        g_stix_id = _stix_get(grp_obj, "id")
+        g_aliases = _get_aliases(grp_obj)
+        g_desc = _stix_get(grp_obj, "description") if include_description else None
 
-        # External ATT&CK ID (GXXXX)
         try:
-            g_attack_id = attack_data.get_attack_id(g_stix_id)
+            g_attack_id = attack_data.get_attack_id(g_stix_id) if g_stix_id else None
         except Exception:
             g_attack_id = None
 
@@ -3622,9 +4172,8 @@ async def get_groups_using_technique(
             }
         )
 
-    # Nicely formatted human-readable block
     formatted = ""
-    if group_objects_for_format:
+    if include_formatted and group_objects_for_format:
         formatted = format_objects(
             group_objects_for_format,
             include_description=include_description,
@@ -3632,6 +4181,7 @@ async def get_groups_using_technique(
         )
 
     return {
+        "found": True,
         "technique": technique_info,
         "count": len(groups_structured),
         "groups": groups_structured,
@@ -3647,22 +4197,23 @@ async def get_groups_using_software(
     software_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all APT groups (intrusion sets) that use a specific software/malware.
 
     This is a reverse lookup: Software → Groups.
-    It follows 'uses' relationships from a software STIX ID (tool/malware)
-    to intrusion sets.
+    Accepts either a STIX ID ("malware--UUID" / "tool--UUID") or an ATT&CK ID (e.g., "S0154").
 
     Args:
-        software_stix_id: STIX ID of the software object
-                          (e.g., "malware--UUID", "tool--UUID").
+        software_stix_id: STIX ID ("malware--UUID", "tool--UUID") or ATT&CK ID (e.g., "S0154").
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include group descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "software": {
               "attack_id": "SXXXX or similar" | null,
               "name": "<software name or null>",
@@ -3700,23 +4251,25 @@ async def get_groups_using_software(
     """
     attack_data = get_attack_data(domain)
 
-    # Optional: resolve software metadata
-    try:
-        sw_obj = attack_data.get_object_by_stix_id(software_stix_id)
-    except Exception:
-        sw_obj = None
+    resolved_id, sw_obj, err = _resolve_stix_object(
+        software_stix_id, domain=domain, expected_stix_type=("malware", "tool")
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "software": None,
+            "count": 0,
+            "groups": [],
+            "formatted": "",
+            "message": err or f"Software '{software_stix_id}' not found in domain '{domain}'.",
+        }
+    software_stix_id = resolved_id
 
     software_info: Optional[Dict[str, Any]] = None
     if sw_obj is not None:
-        if isinstance(sw_obj, dict):
-            s_name = sw_obj.get("name")
-            s_type = sw_obj.get("type")
-            s_desc = sw_obj.get("description") if include_description else None
-        else:
-            s_name = getattr(sw_obj, "name", None)
-            s_type = getattr(sw_obj, "type", None)
-            s_desc = getattr(sw_obj, "description", None) if include_description else None
-
+        s_name = _stix_get(sw_obj, "name")
+        s_type = _stix_get(sw_obj, "type")
+        s_desc = _stix_get(sw_obj, "description") if include_description else None
         try:
             s_attack_id = attack_data.get_attack_id(software_stix_id)
         except Exception:
@@ -3738,6 +4291,7 @@ async def get_groups_using_software(
 
     if not rel_entries:
         return {
+            "found": True,
             "software": software_info,
             "count": 0,
             "groups": [],
@@ -3752,7 +4306,6 @@ async def get_groups_using_software(
     group_objects_for_format: List[Any] = []
 
     for entry in rel_entries:
-        # RelationshipEntry-like or plain group object
         if isinstance(entry, dict) and ("object" in entry or "relationships" in entry):
             grp_obj = entry.get("object", entry)
             rels = entry.get("relationships", [])
@@ -3765,19 +4318,13 @@ async def get_groups_using_software(
 
         group_objects_for_format.append(grp_obj)
 
-        if isinstance(grp_obj, dict):
-            g_name = grp_obj.get("name")
-            g_stix_id = grp_obj.get("id")
-            g_aliases = grp_obj.get("aliases", [])
-            g_desc = grp_obj.get("description") if include_description else None
-        else:
-            g_name = getattr(grp_obj, "name", None)
-            g_stix_id = getattr(grp_obj, "id", None)
-            g_aliases = getattr(grp_obj, "aliases", [])
-            g_desc = getattr(grp_obj, "description", None) if include_description else None
+        g_name = _stix_get(grp_obj, "name")
+        g_stix_id = _stix_get(grp_obj, "id")
+        g_aliases = _get_aliases(grp_obj)
+        g_desc = _stix_get(grp_obj, "description") if include_description else None
 
         try:
-            g_attack_id = attack_data.get_attack_id(g_stix_id)
+            g_attack_id = attack_data.get_attack_id(g_stix_id) if g_stix_id else None
         except Exception:
             g_attack_id = None
 
@@ -3795,7 +4342,7 @@ async def get_groups_using_software(
         )
 
     formatted = ""
-    if group_objects_for_format:
+    if include_formatted and group_objects_for_format:
         formatted = format_objects(
             group_objects_for_format,
             include_description=include_description,
@@ -3803,6 +4350,7 @@ async def get_groups_using_software(
         )
 
     return {
+        "found": True,
         "software": software_info,
         "count": len(groups_structured),
         "groups": groups_structured,
@@ -3818,21 +4366,23 @@ async def get_groups_attributing_to_campaign(
     campaign_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all APT groups (intrusion sets) attributed to a specific campaign.
 
     This is a reverse lookup: Campaign → Groups.
-    It follows attribution relationships from a campaign STIX ID to
-    intrusion sets (groups).
+    Accepts either a STIX ID ("campaign--UUID") or an ATT&CK ID (e.g., "C0024").
 
     Args:
-        campaign_stix_id: STIX ID of the campaign (e.g., "campaign--UUID").
+        campaign_stix_id: STIX ID ("campaign--UUID") or ATT&CK ID (e.g., "C0024").
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include group descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "campaign": {
               "attack_id": "CXXXX" | null,
               "name": "<campaign name or null>",
@@ -3869,21 +4419,24 @@ async def get_groups_attributing_to_campaign(
     """
     attack_data = get_attack_data(domain)
 
-    # Optional: resolve campaign metadata
-    try:
-        camp_obj = attack_data.get_object_by_stix_id(campaign_stix_id)
-    except Exception:
-        camp_obj = None
+    resolved_id, camp_obj, err = _resolve_stix_object(
+        campaign_stix_id, domain=domain, expected_stix_type="campaign"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "campaign": None,
+            "count": 0,
+            "groups": [],
+            "formatted": "",
+            "message": err or f"Campaign '{campaign_stix_id}' not found in domain '{domain}'.",
+        }
+    campaign_stix_id = resolved_id
 
     campaign_info: Optional[Dict[str, Any]] = None
     if camp_obj is not None:
-        if isinstance(camp_obj, dict):
-            c_name = camp_obj.get("name")
-            c_desc = camp_obj.get("description") if include_description else None
-        else:
-            c_name = getattr(camp_obj, "name", None)
-            c_desc = getattr(camp_obj, "description", None) if include_description else None
-
+        c_name = _stix_get(camp_obj, "name")
+        c_desc = _stix_get(camp_obj, "description") if include_description else None
         try:
             c_attack_id = attack_data.get_attack_id(campaign_stix_id)
         except Exception:
@@ -3904,6 +4457,7 @@ async def get_groups_attributing_to_campaign(
 
     if not rel_entries:
         return {
+            "found": True,
             "campaign": campaign_info,
             "count": 0,
             "groups": [],
@@ -3918,7 +4472,6 @@ async def get_groups_attributing_to_campaign(
     group_objects_for_format: List[Any] = []
 
     for entry in rel_entries:
-        # RelationshipEntry-like or plain group object
         if isinstance(entry, dict) and ("object" in entry or "relationships" in entry):
             grp_obj = entry.get("object", entry)
             rels = entry.get("relationships", [])
@@ -3931,21 +4484,13 @@ async def get_groups_attributing_to_campaign(
 
         group_objects_for_format.append(grp_obj)
 
-        # Extract group fields
-        if isinstance(grp_obj, dict):
-            g_name = grp_obj.get("name")
-            g_stix_id = grp_obj.get("id")
-            g_aliases = grp_obj.get("aliases", [])
-            g_desc = grp_obj.get("description") if include_description else None
-        else:
-            g_name = getattr(grp_obj, "name", None)
-            g_stix_id = getattr(grp_obj, "id", None)
-            g_aliases = getattr(grp_obj, "aliases", [])
-            g_desc = getattr(grp_obj, "description", None) if include_description else None
+        g_name = _stix_get(grp_obj, "name")
+        g_stix_id = _stix_get(grp_obj, "id")
+        g_aliases = _get_aliases(grp_obj)
+        g_desc = _stix_get(grp_obj, "description") if include_description else None
 
-        # External ATT&CK ID (GXXXX)
         try:
-            g_attack_id = attack_data.get_attack_id(g_stix_id)
+            g_attack_id = attack_data.get_attack_id(g_stix_id) if g_stix_id else None
         except Exception:
             g_attack_id = None
 
@@ -3963,7 +4508,7 @@ async def get_groups_attributing_to_campaign(
         )
 
     formatted = ""
-    if group_objects_for_format:
+    if include_formatted and group_objects_for_format:
         formatted = format_objects(
             group_objects_for_format,
             include_description=include_description,
@@ -3971,6 +4516,7 @@ async def get_groups_attributing_to_campaign(
         )
 
     return {
+        "found": True,
         "campaign": campaign_info,
         "count": len(groups_structured),
         "groups": groups_structured,
@@ -3990,18 +4536,21 @@ async def get_software_by_alias(
     domain: str = "enterprise",
     include_description: bool = True,
     remove_revoked_deprecated: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
-    Find software/malware by alias (e.g., 'Beacon', 'Mimilib').
+    Find software/malware by alias (e.g., 'Solorigate', 'SUNSHUTTLE', 'Darkmoon').
 
     Many malware/tools have multiple alternative names. This tool searches
-    the software catalog for alias matches.
+    the software catalog for exact case-insensitive alias matches (trimming
+    surrounding whitespace) against software names and `x_mitre_aliases`.
 
     Args:
-        alias: Alias to search for.
+        alias: Alias to search for (e.g., 'Solorigate', 'SUNSHUTTLE').
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include description fields.
         remove_revoked_deprecated: Whether to exclude revoked/deprecated software (default: True).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
@@ -4037,7 +4586,7 @@ async def get_software_by_alias(
                 if alias_norm == (_stix_get(sw, "name", "") or "").strip().lower()
                 or any(
                     alias_norm == (a or "").strip().lower()
-                    for a in (_stix_get(sw, "x_mitre_aliases") or _stix_get(sw, "aliases") or [])
+                    for a in _get_aliases(sw)
                 )
             ]
             results.sort(
@@ -4065,23 +4614,15 @@ async def get_software_by_alias(
     software_objects_for_format = []
 
     for sw in results:
-        # MITRE library returns STIX objects that may be dicts or objects
-        if isinstance(sw, dict):
-            s_name = sw.get("name")
-            s_stix_id = sw.get("id")
-            s_aliases = sw.get("x_mitre_aliases") or sw.get("aliases") or []
-            s_type = sw.get("type")
-            s_desc = sw.get("description") if include_description else None
-        else:
-            s_name = getattr(sw, "name", None)
-            s_stix_id = getattr(sw, "id", None)
-            s_aliases = getattr(sw, "x_mitre_aliases", None) or getattr(sw, "aliases", None) or []
-            s_type = getattr(sw, "type", None)
-            s_desc = getattr(sw, "description", None) if include_description else None
+        s_name = _stix_get(sw, "name")
+        s_stix_id = _stix_get(sw, "id")
+        s_aliases = _get_aliases(sw)
+        s_type = _stix_get(sw, "type")
+        s_desc = _stix_get(sw, "description") if include_description else None
 
         # External ATT&CK ID (e.g., SXXXX)
         try:
-            s_attack_id = attack_data.get_attack_id(s_stix_id)
+            s_attack_id = attack_data.get_attack_id(s_stix_id) if s_stix_id else None
         except Exception:
             s_attack_id = None
 
@@ -4100,7 +4641,7 @@ async def get_software_by_alias(
 
     # Optional human-readable formatting
     formatted = ""
-    if software_objects_for_format:
+    if include_formatted and software_objects_for_format:
         formatted = format_objects(
             software_objects_for_format,
             include_description=include_description,
@@ -4123,22 +4664,23 @@ async def get_software_using_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all software (malware/tools) that use a specific technique.
 
     This is a reverse lookup: Technique → Software.
-    It follows 'uses' relationships from a technique STIX ID to software
-    (malware and tools) that implement or leverage that technique.
+    Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1190").
 
     Args:
-        technique_stix_id: STIX ID of the technique
-                           (e.g., "attack-pattern--UUID").
+        technique_stix_id: STIX ID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include software descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "technique": {
               "attack_id": "TXXXX or TXXXX.YYY" | null,
               "name": "<technique name or null>",
@@ -4152,6 +4694,7 @@ async def get_software_using_technique(
             {
               "attack_id": "SXXXX or similar" | null,
               "name": "<software name>",
+              "aliases": [...],
               "stix_id": "<software STIX ID>",
               "type": "<malware|tool|...>",
               "description": "<text or null>",
@@ -4175,21 +4718,24 @@ async def get_software_using_technique(
     """
     attack_data = get_attack_data(domain)
 
-    # Optional: resolve technique metadata for context
-    try:
-        tech_obj = attack_data.get_object_by_stix_id(technique_stix_id)
-    except Exception:
-        tech_obj = None
+    resolved_id, tech_obj, err = _resolve_stix_object(
+        technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "technique": None,
+            "count": 0,
+            "software": [],
+            "formatted": "",
+            "message": err or f"Technique '{technique_stix_id}' not found in domain '{domain}'.",
+        }
+    technique_stix_id = resolved_id
 
     technique_info: Optional[Dict[str, Any]] = None
     if tech_obj is not None:
-        if isinstance(tech_obj, dict):
-            t_name = tech_obj.get("name")
-            t_desc = tech_obj.get("description") if include_description else None
-        else:
-            t_name = getattr(tech_obj, "name", None)
-            t_desc = getattr(tech_obj, "description", None) if include_description else None
-
+        t_name = _stix_get(tech_obj, "name")
+        t_desc = _stix_get(tech_obj, "description") if include_description else None
         try:
             t_attack_id = attack_data.get_attack_id(technique_stix_id)
         except Exception:
@@ -4210,6 +4756,7 @@ async def get_software_using_technique(
 
     if not rel_entries:
         return {
+            "found": True,
             "technique": technique_info,
             "count": 0,
             "software": [],
@@ -4224,8 +4771,6 @@ async def get_software_using_technique(
     software_objects_for_format: List[Any] = []
 
     for entry in rel_entries:
-        # Some helpers may return RelationshipEntry-like objects (with "object"/"relationships"),
-        # others may return plain software STIX objects. We need to Handle both.
         if isinstance(entry, dict) and ("object" in entry or "relationships" in entry):
             sw_obj = entry.get("object", entry)
             rels = entry.get("relationships", [])
@@ -4238,31 +4783,24 @@ async def get_software_using_technique(
 
         software_objects_for_format.append(sw_obj)
 
-        # Extract software fields
-        if isinstance(sw_obj, dict):
-            s_name = sw_obj.get("name")
-            s_stix_id = sw_obj.get("id")
-            s_type = sw_obj.get("type")
-            s_desc = sw_obj.get("description") if include_description else None
-        else:
-            s_name = getattr(sw_obj, "name", None)
-            s_stix_id = getattr(sw_obj, "id", None)
-            s_type = getattr(sw_obj, "type", None)
-            s_desc = getattr(sw_obj, "description", None) if include_description else None
+        s_name = _stix_get(sw_obj, "name")
+        s_stix_id = _stix_get(sw_obj, "id")
+        s_type = _stix_get(sw_obj, "type")
+        s_aliases = _get_aliases(sw_obj)
+        s_desc = _stix_get(sw_obj, "description") if include_description else None
 
-        # External ATT&CK ID (SXXXX / sometimes other prefix)
         try:
-            s_attack_id = attack_data.get_attack_id(s_stix_id)
+            s_attack_id = attack_data.get_attack_id(s_stix_id) if s_stix_id else None
         except Exception:
             s_attack_id = None
 
-        # Relationship metadata (if present)
         relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         software_structured.append(
             {
                 "attack_id": s_attack_id,
                 "name": s_name,
+                "aliases": s_aliases,
                 "stix_id": s_stix_id,
                 "type": s_type,
                 "description": s_desc,
@@ -4271,7 +4809,7 @@ async def get_software_using_technique(
         )
 
     formatted = ""
-    if software_objects_for_format:
+    if include_formatted and software_objects_for_format:
         formatted = format_objects(
             software_objects_for_format,
             include_description=include_description,
@@ -4279,6 +4817,7 @@ async def get_software_using_technique(
         )
 
     return {
+        "found": True,
         "technique": technique_info,
         "count": len(software_structured),
         "software": software_structured,
@@ -4294,21 +4833,23 @@ async def get_techniques_used_by_software(
     software_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all techniques used by specific software/malware.
 
     This shows what ATT&CK techniques a given software (tool/malware) is
-    capable of performing.
+    capable of performing. Accepts either a STIX ID or an ATT&CK ID (e.g., "S0154").
 
     Args:
-        software_stix_id: STIX ID of the software object
-                          (e.g., "malware--UUID", "tool--UUID").
+        software_stix_id: STIX ID ("malware--UUID", "tool--UUID") or ATT&CK ID (e.g., "S0154").
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include technique descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "software": {
               "attack_id": "SXXXX or similar" | null,
               "name": "<software name or null>",
@@ -4345,23 +4886,25 @@ async def get_techniques_used_by_software(
     """
     attack_data = get_attack_data(domain)
 
-    # Optional: resolve software metadata for context
-    try:
-        sw_obj = attack_data.get_object_by_stix_id(software_stix_id)
-    except Exception:
-        sw_obj = None
+    resolved_id, sw_obj, err = _resolve_stix_object(
+        software_stix_id, domain=domain, expected_stix_type=("malware", "tool")
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "software": None,
+            "count": 0,
+            "techniques": [],
+            "formatted": "",
+            "message": err or f"Software '{software_stix_id}' not found in domain '{domain}'.",
+        }
+    software_stix_id = resolved_id
 
     software_info: Optional[Dict[str, Any]] = None
     if sw_obj is not None:
-        if isinstance(sw_obj, dict):
-            s_name = sw_obj.get("name")
-            s_type = sw_obj.get("type")
-            s_desc = sw_obj.get("description") if include_description else None
-        else:
-            s_name = getattr(sw_obj, "name", None)
-            s_type = getattr(sw_obj, "type", None)
-            s_desc = getattr(sw_obj, "description", None) if include_description else None
-
+        s_name = _stix_get(sw_obj, "name")
+        s_type = _stix_get(sw_obj, "type")
+        s_desc = _stix_get(sw_obj, "description") if include_description else None
         try:
             s_attack_id = attack_data.get_attack_id(software_stix_id)
         except Exception:
@@ -4383,6 +4926,7 @@ async def get_techniques_used_by_software(
 
     if not rel_entries:
         return {
+            "found": True,
             "software": software_info,
             "count": 0,
             "techniques": [],
@@ -4397,7 +4941,6 @@ async def get_techniques_used_by_software(
     technique_objects_for_format: List[Any] = []
 
     for entry in rel_entries:
-        # RelationshipEntry-like or plain technique object
         if isinstance(entry, dict) and ("object" in entry or "relationships" in entry):
             tech_obj = entry.get("object", entry)
             rels = entry.get("relationships", [])
@@ -4410,23 +4953,15 @@ async def get_techniques_used_by_software(
 
         technique_objects_for_format.append(tech_obj)
 
-        # Extract technique info
-        if isinstance(tech_obj, dict):
-            t_name = tech_obj.get("name")
-            t_stix_id = tech_obj.get("id")
-            t_desc = tech_obj.get("description") if include_description else None
-        else:
-            t_name = getattr(tech_obj, "name", None)
-            t_stix_id = getattr(tech_obj, "id", None)
-            t_desc = getattr(tech_obj, "description", None) if include_description else None
+        t_name = _stix_get(tech_obj, "name")
+        t_stix_id = _stix_get(tech_obj, "id")
+        t_desc = _stix_get(tech_obj, "description") if include_description else None
 
-        # External ATT&CK ID (TXXXX / TXXXX.YYY)
         try:
-            t_attack_id = attack_data.get_attack_id(t_stix_id)
+            t_attack_id = attack_data.get_attack_id(t_stix_id) if t_stix_id else None
         except Exception:
             t_attack_id = None
 
-        # Relationship metadata
         relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         techniques_structured.append(
@@ -4440,7 +4975,7 @@ async def get_techniques_used_by_software(
         )
 
     formatted = ""
-    if technique_objects_for_format:
+    if include_formatted and technique_objects_for_format:
         formatted = format_objects(
             technique_objects_for_format,
             include_description=include_description,
@@ -4448,6 +4983,7 @@ async def get_techniques_used_by_software(
         )
 
     return {
+        "found": True,
         "software": software_info,
         "count": len(techniques_structured),
         "techniques": techniques_structured,
@@ -4467,6 +5003,9 @@ async def get_all_techniques(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK techniques for a given domain.
@@ -4475,11 +5014,19 @@ async def get_all_techniques(
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated techniques.
         include_description: Whether to include technique descriptions.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
           "domain": "<domain>",
-          "count": <number of techniques>,
+          "count": <number of techniques in this page>,
+          "total_count": <total number of techniques>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "techniques": [
             {
               "attack_id": "TXXXX or TXXXX.YYY",
@@ -4495,8 +5042,8 @@ async def get_all_techniques(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # Fetch techniques from MITRE library
     try:
         techniques = attack_data.get_techniques(
             remove_revoked_deprecated=remove_revoked_deprecated
@@ -4505,6 +5052,11 @@ async def get_all_techniques(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": f"Unable to retrieve techniques for domain '{domain}'."
@@ -4514,41 +5066,37 @@ async def get_all_techniques(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": f"No techniques found in domain '{domain}'."
         }
 
+    techniques_sorted = sorted(
+        techniques,
+        key=lambda t: (
+            str(_stix_get(t, "name") or ""),
+            str(_stix_get(t, "id") or ""),
+        ),
+    )
+    page_techniques, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        techniques_sorted, limit=limit, offset=offset
+    )
+
     structured = []
-    technique_objects_for_format = []
-
-    for tech in techniques:
-        technique_objects_for_format.append(tech)
-
-        # Extract fields (both dict or object)
-        if isinstance(tech, dict):
-            name = tech.get("name")
-            stix_id = tech.get("id")
-            description = tech.get("description") if include_description else None
-            phases = tech.get("kill_chain_phases", [])
-        else:
-            name = getattr(tech, "name", None)
-            stix_id = getattr(tech, "id", None)
-            description = getattr(tech, "description", None) if include_description else None
-            phases = getattr(tech, "kill_chain_phases", [])
-
-        # ATT&CK external ID (TXXXX)
+    for tech in page_techniques:
+        name = _stix_get(tech, "name")
+        stix_id = _stix_get(tech, "id")
+        description = _stix_get(tech, "description") if include_description else None
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
-
-        # Map kill chain phases to readable tactics
-        tactics = []
-        for p in phases or []:
-            phase_name = getattr(p, "phase_name", None) or p.get("phase_name")
-            if phase_name:
-                tactics.append(phase_name.replace("-", " ").title())
+        tactics = _extract_tactic_names(tech)
 
         structured.append(
             {
@@ -4560,11 +5108,10 @@ async def get_all_techniques(
             }
         )
 
-    # Formatted block (optional)
     formatted = ""
-    if technique_objects_for_format:
+    if include_formatted and page_techniques:
         formatted = format_objects(
-            technique_objects_for_format,
+            page_techniques,
             include_description=include_description,
             domain=domain,
         )
@@ -4572,11 +5119,16 @@ async def get_all_techniques(
     return {
         "domain": domain,
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "techniques": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} technique(s) in domain '{domain}' "
-            f"(remove_revoked_deprecated={remove_revoked_deprecated})."
+            f"Found {total_count} technique(s) in domain '{domain}' "
+            f"(remove_revoked_deprecated={remove_revoked_deprecated}, returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -4585,6 +5137,9 @@ async def get_all_subtechniques(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all subtechniques in a given ATT&CK domain.
@@ -4596,11 +5151,19 @@ async def get_all_subtechniques(
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated subtechniques.
         include_description: Whether to include descriptions.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
           "domain": "<domain>",
-          "count": <number of subtechniques>,
+          "count": <number of subtechniques in this page>,
+          "total_count": <total number of subtechniques>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "subtechniques": [
             {
               "attack_id": "<TXXXX.YYY>",
@@ -4619,85 +5182,91 @@ async def get_all_subtechniques(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # Get all techniques including subtechniques
     try:
-        all_techniques = attack_data.get_techniques(
+        subtechniques = attack_data.get_subtechniques(
             remove_revoked_deprecated=remove_revoked_deprecated,
-            include_subtechniques=True,
-        )
+        ) or []
     except Exception:
+        try:
+            all_techniques = attack_data.get_techniques(
+                remove_revoked_deprecated=remove_revoked_deprecated,
+                include_subtechniques=True,
+            ) or []
+            subtechniques = [
+                t for t in all_techniques if bool(_stix_get(t, "x_mitre_is_subtechnique", False))
+            ]
+        except Exception:
+            return {
+                "domain": domain,
+                "count": 0,
+                "total_count": 0,
+                "offset": safe_offset,
+                "limit": safe_limit,
+                "has_more": False,
+                "next_offset": None,
+                "subtechniques": [],
+                "formatted": "",
+                "message": f"Unable to retrieve techniques for domain '{domain}'.",
+            }
+
+    if not subtechniques:
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "subtechniques": [],
             "formatted": "",
-            "message": f"Unable to retrieve techniques for domain '{domain}'.",
+            "message": (
+                f"No subtechniques found in domain '{domain}' "
+                f"(remove_revoked_deprecated={remove_revoked_deprecated})."
+            ),
         }
 
-    subtechnique_objects: List[Any] = []
+    subtechniques_sorted = sorted(
+        subtechniques,
+        key=lambda t: (
+            str(_stix_get(t, "name") or ""),
+            str(_stix_get(t, "id") or ""),
+        ),
+    )
+    page_subs, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        subtechniques_sorted, limit=limit, offset=offset
+    )
+
     structured: List[Dict[str, Any]] = []
+    for t in page_subs:
+        stix_id = _stix_get(t, "id")
+        name = _stix_get(t, "name")
+        description = _stix_get(t, "description") if include_description else None
+        tactics = _extract_tactic_names(t)
 
-    for t in all_techniques:
-        # Determine the STIX ID for this technique
-        if isinstance(t, dict):
-            stix_id = t.get("id")
-            name = t.get("name")
-            description = t.get("description") if include_description else None
-            phases = t.get("kill_chain_phases", []) or []
-        else:
-            stix_id = getattr(t, "id", None)
-            name = getattr(t, "name", None)
-            description = getattr(t, "description", None) if include_description else None
-            phases = getattr(t, "kill_chain_phases", []) or []
-
-        if not stix_id:
-            continue
-
-        # Check if this technique has a parent (i.e., is a subtechnique)
         try:
-            parent_obj = attack_data.get_parent_technique_of_subtechnique(stix_id)
-        except Exception:
-            parent_obj = None
-
-        if not parent_obj:
-            # Not a subtechnique
-            continue
-
-        # At this point, t is a subtechnique
-        subtechnique_objects.append(t)
-
-        # Resolve subtechnique ATT&CK ID
-        try:
-            sub_attack_id = attack_data.get_attack_id(stix_id)
+            sub_attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             sub_attack_id = None
 
-        # Resolve parent fields
-        if isinstance(parent_obj, dict):
-            parent_stix_id = parent_obj.get("id")
-            parent_name = parent_obj.get("name")
-        else:
-            parent_stix_id = getattr(parent_obj, "id", None)
-            parent_name = getattr(parent_obj, "name", None)
-
-        try:
-            parent_attack_id = (
-                attack_data.get_attack_id(parent_stix_id) if parent_stix_id else None
-            )
-        except Exception:
-            parent_attack_id = None
-
-        # Extract tactics from kill_chain_phases
-        tactics: List[str] = []
-        for p in phases:
-            if isinstance(p, dict):
-                phase_name = p.get("phase_name")
-            else:
-                phase_name = getattr(p, "phase_name", None)
-
-            if phase_name:
-                tactics.append(phase_name.replace("-", " ").title())
+        parent_stix_id = None
+        parent_name = None
+        parent_attack_id = None
+        if stix_id:
+            try:
+                parent_raw = attack_data.get_parent_technique_of_subtechnique(stix_id)
+                if isinstance(parent_raw, list):
+                    parent_raw = parent_raw[0] if parent_raw else None
+                parent_obj = _unwrap_stix_object(parent_raw)
+                if parent_obj is not None:
+                    parent_stix_id = _stix_get(parent_obj, "id")
+                    parent_name = _stix_get(parent_obj, "name")
+                    if parent_stix_id:
+                        parent_attack_id = attack_data.get_attack_id(parent_stix_id)
+            except Exception:
+                pass
 
         structured.append(
             {
@@ -4712,33 +5281,29 @@ async def get_all_subtechniques(
             }
         )
 
-    if not structured:
-        return {
-            "domain": domain,
-            "count": 0,
-            "subtechniques": [],
-            "formatted": "",
-            "message": (
-                f"No subtechniques found in domain '{domain}' "
-                f"(remove_revoked_deprecated={remove_revoked_deprecated})."
-            ),
-        }
-
-    # Optional human-readable formatting using your existing helper
-    formatted = format_objects(
-        subtechnique_objects,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_subs,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "domain": domain,
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "subtechniques": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} subtechnique(s) in domain '{domain}' "
-            f"(remove_revoked_deprecated={remove_revoked_deprecated})."
+            f"Found {total_count} subtechnique(s) in domain '{domain}' "
+            f"(remove_revoked_deprecated={remove_revoked_deprecated}, returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -4747,6 +5312,9 @@ async def get_all_parent_techniques(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all parent techniques (exclude subtechniques) in a given domain.
@@ -4758,11 +5326,19 @@ async def get_all_parent_techniques(
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated techniques.
         include_description: Whether to include descriptions.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
           "domain": "<domain>",
-          "count": <number of parent techniques>,
+          "count": <number of parent techniques in this page>,
+          "total_count": <total number of parent techniques>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "parent_techniques": [
             {
               "attack_id": "<TXXXX>",
@@ -4778,9 +5354,9 @@ async def get_all_parent_techniques(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
     try:
-        # This call *already* returns techniques without including subtechniques
         techniques = attack_data.get_techniques(
             remove_revoked_deprecated=remove_revoked_deprecated
         )
@@ -4788,71 +5364,38 @@ async def get_all_parent_techniques(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "parent_techniques": [],
             "formatted": "",
             "message": f"Unable to retrieve techniques for domain '{domain}'.",
         }
 
-    parent_objects: List[Any] = []
-    structured: List[Dict[str, Any]] = []
-
+    parent_candidates: List[Tuple[str, Any]] = []
     for t in techniques:
-        # Extract STIX ID, name, description, kill chain phases
-        if isinstance(t, dict):
-            stix_id = t.get("id")
-            name = t.get("name")
-            description = t.get("description") if include_description else None
-            phases = t.get("kill_chain_phases", []) or []
-        else:
-            stix_id = getattr(t, "id", None)
-            name = getattr(t, "name", None)
-            description = getattr(t, "description", None) if include_description else None
-            phases = getattr(t, "kill_chain_phases", []) or []
-
+        stix_id = _stix_get(t, "id")
         if not stix_id:
             continue
-
-        # Resolve ATT&CK ID
         try:
             attack_id = attack_data.get_attack_id(stix_id)
         except Exception:
             attack_id = None
-
-        if not attack_id:
-            # If we can't resolve an ATT&CK ID, skip parent-check
+        if not attack_id or "." in attack_id:
             continue
+        parent_candidates.append((attack_id, t))
 
-        # Parent techniques: no dot in ATT&CK ID
-        if "." in attack_id:
-            continue
-
-        parent_objects.append(t)
-
-        # Extract tactics from kill_chain_phases
-        tactics: List[str] = []
-        for p in phases:
-            if isinstance(p, dict):
-                phase_name = p.get("phase_name")
-            else:
-                phase_name = getattr(p, "phase_name", None)
-
-            if phase_name:
-                tactics.append(phase_name.replace("-", " ").title())
-
-        structured.append(
-            {
-                "attack_id": attack_id,
-                "name": name,
-                "stix_id": stix_id,
-                "description": description,
-                "tactics": tactics,
-            }
-        )
-
-    if not structured:
+    if not parent_candidates:
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "parent_techniques": [],
             "formatted": "",
             "message": (
@@ -4861,20 +5404,53 @@ async def get_all_parent_techniques(
             ),
         }
 
-    formatted = format_objects(
-        parent_objects,
-        include_description=include_description,
-        domain=domain,
+    parent_candidates.sort(
+        key=lambda pair: (
+            pair[0],
+            str(_stix_get(pair[1], "id") or ""),
+        )
+    )
+    page_pairs, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        parent_candidates, limit=limit, offset=offset
+    )
+
+    parent_objects: List[Any] = []
+    structured: List[Dict[str, Any]] = []
+    for attack_id, t in page_pairs:
+        parent_objects.append(t)
+        structured.append(
+            {
+                "attack_id": attack_id,
+                "name": _stix_get(t, "name"),
+                "stix_id": _stix_get(t, "id"),
+                "description": _stix_get(t, "description") if include_description else None,
+                "tactics": _extract_tactic_names(t),
+            }
+        )
+
+    formatted = (
+        format_objects(
+            parent_objects,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "domain": domain,
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "parent_techniques": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} parent technique(s) in domain '{domain}' "
-            f"(remove_revoked_deprecated={remove_revoked_deprecated})."
+            f"Found {total_count} parent technique(s) in domain '{domain}' "
+            f"(remove_revoked_deprecated={remove_revoked_deprecated}, returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -4883,6 +5459,9 @@ async def get_all_groups(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all APT groups (intrusion sets) in a domain.
@@ -4891,11 +5470,19 @@ async def get_all_groups(
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated groups.
         include_description: Whether to include descriptions.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
           "domain": "<domain>",
-          "count": <number of groups>,
+          "count": <number of groups in this page>,
+          "total_count": <total number of groups>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "groups": [
             {
               "attack_id": "GXXXX",
@@ -4911,8 +5498,8 @@ async def get_all_groups(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # Fetch groups
     try:
         groups = attack_data.get_groups(
             remove_revoked_deprecated=remove_revoked_deprecated
@@ -4921,6 +5508,11 @@ async def get_all_groups(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "groups": [],
             "formatted": "",
             "message": f"Unable to retrieve groups for domain '{domain}'."
@@ -4930,6 +5522,11 @@ async def get_all_groups(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "groups": [],
             "formatted": "",
             "message": (
@@ -4938,26 +5535,25 @@ async def get_all_groups(
             )
         }
 
+    groups_sorted = sorted(
+        groups,
+        key=lambda g: (
+            str(_stix_get(g, "name") or ""),
+            str(_stix_get(g, "id") or ""),
+        ),
+    )
+    page_groups, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        groups_sorted, limit=limit, offset=offset
+    )
+
     structured = []
-    groups_for_format = []
-
-    for g in groups:
-        groups_for_format.append(g)
-
-        if isinstance(g, dict):
-            name = g.get("name")
-            stix_id = g.get("id")
-            aliases = g.get("aliases", [])
-            description = g.get("description") if include_description else None
-        else:
-            name = getattr(g, "name", None)
-            stix_id = getattr(g, "id", None)
-            aliases = getattr(g, "aliases", [])
-            description = getattr(g, "description", None) if include_description else None
-
-        # External ATT&CK ID (GXXXX)
+    for g in page_groups:
+        name = _stix_get(g, "name")
+        stix_id = _stix_get(g, "id")
+        aliases = _get_aliases(g)
+        description = _stix_get(g, "description") if include_description else None
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
@@ -4971,21 +5567,29 @@ async def get_all_groups(
             }
         )
 
-    # Optional formatted human-readable block
-    formatted = format_objects(
-        groups_for_format,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_groups,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "domain": domain,
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "groups": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} APT group(s) in domain '{domain}' "
-            f"(remove_revoked_deprecated={remove_revoked_deprecated})."
+            f"Found {total_count} APT group(s) in domain '{domain}' "
+            f"(remove_revoked_deprecated={remove_revoked_deprecated}, returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -4994,6 +5598,9 @@ async def get_all_software(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all software (malware and tools) in a domain.
@@ -5005,11 +5612,19 @@ async def get_all_software(
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated software.
         include_description: Whether to include descriptions.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
           "domain": "<domain>",
-          "count": <number of software objects>,
+          "count": <number of software objects in this page>,
+          "total_count": <total number of software objects>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "software": [
             {
               "attack_id": "<SXXXX or similar> | null",
@@ -5026,8 +5641,8 @@ async def get_all_software(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # Fetch software objects from the MITRE library
     try:
         software_items = attack_data.get_software(
             remove_revoked_deprecated=remove_revoked_deprecated
@@ -5036,6 +5651,11 @@ async def get_all_software(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "software": [],
             "formatted": "",
             "message": f"Unable to retrieve software for domain '{domain}'.",
@@ -5045,6 +5665,11 @@ async def get_all_software(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "software": [],
             "formatted": "",
             "message": (
@@ -5053,28 +5678,26 @@ async def get_all_software(
             ),
         }
 
+    software_sorted = sorted(
+        software_items,
+        key=lambda s: (
+            str(_stix_get(s, "name") or ""),
+            str(_stix_get(s, "id") or ""),
+        ),
+    )
+    page_software, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        software_sorted, limit=limit, offset=offset
+    )
+
     structured: List[Dict[str, Any]] = []
-    software_for_format: List[Any] = []
-
-    for sw in software_items:
-        software_for_format.append(sw)
-
-        if isinstance(sw, dict):
-            name = sw.get("name")
-            stix_id = sw.get("id")
-            aliases = sw.get("aliases", [])
-            sw_type = sw.get("type")
-            description = sw.get("description") if include_description else None
-        else:
-            name = getattr(sw, "name", None)
-            stix_id = getattr(sw, "id", None)
-            aliases = getattr(sw, "aliases", [])
-            sw_type = getattr(sw, "type", None)
-            description = getattr(sw, "description", None) if include_description else None
-
-        # External ATT&CK ID (often SXXXX)
+    for sw in page_software:
+        name = _stix_get(sw, "name")
+        stix_id = _stix_get(sw, "id")
+        aliases = _get_aliases(sw)
+        sw_type = _stix_get(sw, "type")
+        description = _stix_get(sw, "description") if include_description else None
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
@@ -5089,21 +5712,29 @@ async def get_all_software(
             }
         )
 
-    # Optional human-readable formatted view
-    formatted = format_objects(
-        software_for_format,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_software,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "domain": domain,
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "software": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} software object(s) in domain '{domain}' "
-            f"(remove_revoked_deprecated={remove_revoked_deprecated})."
+            f"Found {total_count} software object(s) in domain '{domain}' "
+            f"(remove_revoked_deprecated={remove_revoked_deprecated}, returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -5112,6 +5743,9 @@ async def get_all_mitigations(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all mitigations (defensive countermeasures) in a domain.
@@ -5123,11 +5757,19 @@ async def get_all_mitigations(
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated mitigations.
         include_description: Whether to include descriptions.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
           "domain": "<domain>",
-          "count": <number of mitigations>,
+          "count": <number of mitigations in this page>,
+          "total_count": <total number of mitigations>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "mitigations": [
             {
               "attack_id": "MXXXX" | null,
@@ -5142,8 +5784,8 @@ async def get_all_mitigations(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # Fetch mitigations from MITRE library
     try:
         mitigations = attack_data.get_mitigations(
             remove_revoked_deprecated=remove_revoked_deprecated
@@ -5152,6 +5794,11 @@ async def get_all_mitigations(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "mitigations": [],
             "formatted": "",
             "message": f"Unable to retrieve mitigations for domain '{domain}'.",
@@ -5161,6 +5808,11 @@ async def get_all_mitigations(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "mitigations": [],
             "formatted": "",
             "message": (
@@ -5169,24 +5821,24 @@ async def get_all_mitigations(
             ),
         }
 
+    mitigations_sorted = sorted(
+        mitigations,
+        key=lambda m: (
+            str(_stix_get(m, "name") or ""),
+            str(_stix_get(m, "id") or ""),
+        ),
+    )
+    page_mitigations, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        mitigations_sorted, limit=limit, offset=offset
+    )
+
     structured: List[Dict[str, Any]] = []
-    mitigations_for_format: List[Any] = []
-
-    for m in mitigations:
-        mitigations_for_format.append(m)
-
-        if isinstance(m, dict):
-            name = m.get("name")
-            stix_id = m.get("id")
-            description = m.get("description") if include_description else None
-        else:
-            name = getattr(m, "name", None)
-            stix_id = getattr(m, "id", None)
-            description = getattr(m, "description", None) if include_description else None
-
-        # External ATT&CK ID (MXXXX)
+    for m in page_mitigations:
+        name = _stix_get(m, "name")
+        stix_id = _stix_get(m, "id")
+        description = _stix_get(m, "description") if include_description else None
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
@@ -5199,21 +5851,29 @@ async def get_all_mitigations(
             }
         )
 
-    # Optional human-readable formatting
-    formatted = format_objects(
-        mitigations_for_format,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_mitigations,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "domain": domain,
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "mitigations": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} mitigation(s) in domain '{domain}' "
-            f"(remove_revoked_deprecated={remove_revoked_deprecated})."
+            f"Found {total_count} mitigation(s) in domain '{domain}' "
+            f"(remove_revoked_deprecated={remove_revoked_deprecated}, returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -5221,16 +5881,18 @@ async def get_all_mitigations(
 async def get_all_tactics(
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK tactics for a domain.
 
     Tactics represent the adversary's tactical goals (e.g., Initial Access,
-    Defense Evasion, Persistence).
+    Stealth, Defense Impairment, Persistence).
 
     Args:
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics')
         include_description: Whether to include tactic descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
@@ -5297,10 +5959,14 @@ async def get_all_tactics(
         )
 
     # Human readable formatting (optional)
-    formatted = format_objects(
-        tactics_for_format,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            tactics_for_format,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
@@ -5428,26 +6094,38 @@ async def get_all_campaigns(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK campaigns in a domain.
 
-    Campaigns represent specific intrusion events or long-running operations 
+    Campaigns represent specific intrusion events or long-running operations
     attributed to threat actors (e.g., SolarWinds, Operation Ghost).
 
     Args:
         domain: ATT&CK domain ("enterprise", "mobile", "ics")
         remove_revoked_deprecated: Whether to exclude revoked/deprecated entries
         include_description: Include campaign descriptions in the output
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
           "domain": "<domain>",
           "count": <int>,
+          "total_count": <int>,
+          "offset": <int>,
+          "limit": <int>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "campaigns": [
              {
                 "attack_id": "<Cxxxx or None>",
                 "name": "<campaign name>",
+                "aliases": [...],
                 "stix_id": "campaign--UUID",
                 "description": "<text or null>"
              },
@@ -5458,8 +6136,8 @@ async def get_all_campaigns(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # Fetch from MITRE data
     try:
         campaigns = attack_data.get_campaigns(
             remove_revoked_deprecated=remove_revoked_deprecated
@@ -5468,6 +6146,11 @@ async def get_all_campaigns(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "campaigns": [],
             "formatted": "",
             "message": f"Unable to retrieve campaigns for domain '{domain}'.",
@@ -5477,6 +6160,11 @@ async def get_all_campaigns(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "campaigns": [],
             "formatted": "",
             "message": (
@@ -5485,27 +6173,25 @@ async def get_all_campaigns(
             ),
         }
 
+    campaigns_sorted = sorted(
+        campaigns,
+        key=lambda c: (
+            str(_stix_get(c, "name") or ""),
+            str(_stix_get(c, "id") or ""),
+        ),
+    )
+    page_campaigns, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        campaigns_sorted, limit=limit, offset=offset
+    )
+
     structured: List[Dict[str, Any]] = []
-    campaigns_for_format: List[Any] = []
-
-    for c in campaigns:
-        campaigns_for_format.append(c)
-
-        # Extract fields safely
-        if isinstance(c, dict):
-            name = c.get("name")
-            stix_id = c.get("id")
-            aliases = c.get("aliases") or c.get("x_mitre_aliases") or []
-            description = c.get("description") if include_description else None
-        else:
-            name = getattr(c, "name", None)
-            stix_id = getattr(c, "id", None)
-            aliases = getattr(c, "aliases", None) or getattr(c, "x_mitre_aliases", None) or []
-            description = getattr(c, "description", None) if include_description else None
-
-        # Lookup ATT&CK ID (sometimes campaigns do have Cxxxx IDs)
+    for c in page_campaigns:
+        name = _stix_get(c, "name")
+        stix_id = _stix_get(c, "id")
+        aliases = _get_aliases(c)
+        description = _stix_get(c, "description") if include_description else None
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
@@ -5519,21 +6205,29 @@ async def get_all_campaigns(
             }
         )
 
-    # Human-readable formatted block
-    formatted = format_objects(
-        campaigns_for_format,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_campaigns,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "domain": domain,
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "campaigns": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} campaign(s) in domain '{domain}' "
-            f"(remove_revoked_deprecated={remove_revoked_deprecated})."
+            f"Found {total_count} campaign(s) in domain '{domain}' "
+            f"(remove_revoked_deprecated={remove_revoked_deprecated}, returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -5656,6 +6350,9 @@ async def get_all_datacomponents(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK data components in a domain.
@@ -5668,13 +6365,22 @@ async def get_all_datacomponents(
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated entries.
         include_description: Whether to include descriptions.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
           "domain": "<domain>",
-          "count": <number of data components>,
+          "count": <number of data components in this page>,
+          "total_count": <total number of data components>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
           "datacomponents": [
             {
+              "attack_id": "<DCxxxx or null>",
               "name": "<data component name>",
               "stix_id": "<x-mitre-data-component--UUID>",
               "description": "<text or null>",
@@ -5689,8 +6395,8 @@ async def get_all_datacomponents(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # Fetch data components
     try:
         datacomponents = attack_data.get_datacomponents(
             remove_revoked_deprecated=remove_revoked_deprecated
@@ -5699,6 +6405,11 @@ async def get_all_datacomponents(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "datacomponents": [],
             "formatted": "",
             "message": f"Unable to retrieve data components for domain '{domain}'.",
@@ -5708,6 +6419,11 @@ async def get_all_datacomponents(
         return {
             "domain": domain,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "datacomponents": [],
             "formatted": "",
             "message": (
@@ -5716,24 +6432,36 @@ async def get_all_datacomponents(
             ),
         }
 
+    dc_with_ids: List[Tuple[str, Any]] = []
+    for dc in datacomponents:
+        sid = _stix_get(dc, "id")
+        try:
+            aid = attack_data.get_attack_id(sid) if sid else None
+        except Exception:
+            aid = None
+        dc_with_ids.append((aid or "", dc))
+
+    dc_with_ids.sort(
+        key=lambda pair: (
+            pair[0] or "ZZZ",
+            str(_stix_get(pair[1], "name") or ""),
+            str(_stix_get(pair[1], "id") or ""),
+        )
+    )
+    page_pairs, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        dc_with_ids, limit=limit, offset=offset
+    )
+
     structured: List[Dict[str, Any]] = []
     dc_for_format: List[Any] = []
 
-    for dc in datacomponents:
+    for dc_aid_key, dc in page_pairs:
         dc_for_format.append(dc)
+        name = _stix_get(dc, "name")
+        stix_id = _stix_get(dc, "id")
+        description = _stix_get(dc, "description") if include_description else None
+        ds_ref = _stix_get(dc, "x_mitre_data_source_ref") or _stix_get(dc, "x-mitre-data-source-ref")
 
-        if isinstance(dc, dict):
-            name = dc.get("name")
-            stix_id = dc.get("id")
-            description = dc.get("description") if include_description else None
-            ds_ref = dc.get("x_mitre_data_source_ref") or dc.get("x-mitre-data-source-ref")
-        else:
-            name = getattr(dc, "name", None)
-            stix_id = getattr(dc, "id", None)
-            description = getattr(dc, "description", None) if include_description else None
-            ds_ref = getattr(dc, "x_mitre_data_source_ref", None)
-
-        # Resolve parent data source (if present)
         data_source_name = None
         data_source_attack_id = None
         data_source_stix_id = ds_ref
@@ -5745,26 +6473,16 @@ async def get_all_datacomponents(
                 ds_obj = None
 
             if ds_obj is not None:
-                if isinstance(ds_obj, dict):
-                    data_source_name = ds_obj.get("name")
-                    ds_id_for_attack = ds_obj.get("id")
-                else:
-                    data_source_name = getattr(ds_obj, "name", None)
-                    ds_id_for_attack = getattr(ds_obj, "id", None)
-
+                data_source_name = _stix_get(ds_obj, "name")
+                ds_id_for_attack = _stix_get(ds_obj, "id")
                 try:
-                    data_source_attack_id = attack_data.get_attack_id(ds_id_for_attack)
+                    data_source_attack_id = attack_data.get_attack_id(ds_id_for_attack) if ds_id_for_attack else None
                 except Exception:
                     data_source_attack_id = None
 
-        try:
-            dc_attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
-        except Exception:
-            dc_attack_id = None
-
         structured.append(
             {
-                "attack_id": dc_attack_id,
+                "attack_id": dc_aid_key or None,
                 "name": name,
                 "stix_id": stix_id,
                 "description": description,
@@ -5774,21 +6492,29 @@ async def get_all_datacomponents(
             }
         )
 
-    # Optional human-readable formatting
-    formatted = format_objects(
-        dc_for_format,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            dc_for_format,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "domain": domain,
         "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "datacomponents": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} data component(s) in domain '{domain}' "
-            f"(remove_revoked_deprecated={remove_revoked_deprecated})."
+            f"Found {total_count} data component(s) in domain '{domain}' "
+            f"(remove_revoked_deprecated={remove_revoked_deprecated}, returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -5912,28 +6638,33 @@ async def get_assets_targeted_by_technique(
     technique_stix_id: str,
     domain: str = "ics",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ICS assets targeted by a specific technique.
 
     Assets represent industrial control system components such as
     PLCs, RTUs, Engineering Workstations, HMIs, Control Servers, etc.
+    Accepts either a STIX ID or an ATT&CK ID (e.g., "T0816").
 
     Args:
-        technique_stix_id: Technique STIX UUID identifier
-        domain: ATT&CK domain ('ics' strongly recommended)
-        include_description: Include asset descriptions, if available
+        technique_stix_id: Technique STIX UUID or ATT&CK ID (e.g., "T0816").
+        domain: ATT&CK domain ('ics' strongly recommended).
+        include_description: Include asset descriptions, if available.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "technique": {
               "attack_id": "Txxxx",
               "name": "...",
               "stix_id": "<attack-pattern--UUID>"
-          },
+          } | null,
           "count": int,
           "assets": [
             {
+              "attack_id": "Axxxx",
               "name": "...",
               "stix_id": "<x-mitre-asset--UUID>",
               "description": "<optional text>",
@@ -5947,24 +6678,25 @@ async def get_assets_targeted_by_technique(
     """
     attack_data = get_attack_data(domain)
 
-    # --- Resolve technique metadata ---
-    try:
-        tech_obj = attack_data.get_object_by_stix_id(technique_stix_id)
-    except Exception:
-        tech_obj = None
+    resolved_id, tech_obj, err = _resolve_stix_object(
+        technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "technique": None,
+            "count": 0,
+            "assets": [],
+            "formatted": "",
+            "message": err or f"Technique '{technique_stix_id}' not found in domain '{domain}'.",
+        }
+    technique_stix_id = resolved_id
 
-    if tech_obj is not None:
-        t_name = getattr(tech_obj, "name", None)
-        try:
-            t_attack_id = attack_data.get_attack_id(technique_stix_id)
-        except Exception:
-            t_attack_id = None
-    else:
-        t_name = None
-        try:
-            t_attack_id = attack_data.get_attack_id(technique_stix_id)
-        except Exception:
-            t_attack_id = None
+    t_name = _stix_get(tech_obj, "name") if tech_obj is not None else None
+    try:
+        t_attack_id = attack_data.get_attack_id(technique_stix_id)
+    except Exception:
+        t_attack_id = None
 
     technique_info = {
         "attack_id": t_attack_id,
@@ -5972,7 +6704,6 @@ async def get_assets_targeted_by_technique(
         "stix_id": technique_stix_id,
     }
 
-    # --- Fetch assets targeted by this technique ---
     try:
         assets = attack_data.get_assets_targeted_by_technique(
             technique_stix_id
@@ -5982,6 +6713,7 @@ async def get_assets_targeted_by_technique(
 
     if not assets:
         return {
+            "found": True,
             "technique": technique_info,
             "count": 0,
             "assets": [],
@@ -5992,7 +6724,6 @@ async def get_assets_targeted_by_technique(
             ),
         }
 
-    # --- Build the structured list of assets ---
     asset_entries = []
     unwrapped_assets = []
     for item in assets:
@@ -6019,14 +6750,18 @@ async def get_assets_targeted_by_technique(
             }
         )
 
-    # --- Human-readable formatting ---
-    formatted = format_objects(
-        unwrapped_assets,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            unwrapped_assets,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
+        "found": True,
         "technique": technique_info,
         "count": len(asset_entries),
         "assets": asset_entries,
@@ -6042,24 +6777,36 @@ async def get_techniques_targeting_asset(
     asset_stix_id: str,
     domain: str = "ics",
     include_description: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all techniques that target a specific ICS asset.
 
     Shows which adversary techniques can affect a given industrial
-    control system component.
+    control system component. Accepts either a STIX ID or an ATT&CK ID (e.g., "A0003").
 
     Args:
-        asset_stix_id: STIX ID of the ICS asset
-        domain: Domain (default: 'ics')
-        include_description: Whether to include descriptions in formatted output
+        asset_stix_id: STIX ID ("x-mitre-asset--UUID") or ATT&CK ID (e.g., "A0003") of the ICS asset.
+        domain: Domain (default: 'ics').
+        include_description: Whether to include descriptions in formatted output.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
             "found": bool,
             "count": int,
+            "total_count": int,
+            "offset": int,
+            "limit": int,
+            "has_more": bool,
+            "next_offset": int | null,
             "techniques": [
                 {
+                    "attack_id": "<ATT&CK ID>",
                     "id": "<ATT&CK ID>",
                     "name": "...",
                     "stix_id": "...",
@@ -6072,6 +6819,25 @@ async def get_techniques_targeting_asset(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
+
+    resolved_id, _asset_obj, err = _resolve_stix_object(
+        asset_stix_id, domain=domain, expected_stix_type="x-mitre-asset"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "techniques": [],
+            "formatted": "",
+            "message": err or f"Asset '{asset_stix_id}' not found in domain '{domain}'.",
+        }
+    asset_stix_id = resolved_id
 
     try:
         techniques = attack_data.get_techniques_targeting_asset(asset_stix_id) or []
@@ -6079,6 +6845,11 @@ async def get_techniques_targeting_asset(
         return {
             "found": False,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": f"Error retrieving techniques: {e}",
@@ -6088,19 +6859,32 @@ async def get_techniques_targeting_asset(
         return {
             "found": False,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": f"No techniques found targeting asset '{asset_stix_id}' in domain '{domain}'.",
         }
 
-    # Build machine-readable list
+    unwrapped_all = [
+        t for t in (_unwrap_stix_object(item) for item in techniques) if t is not None
+    ]
+    unwrapped_sorted = sorted(
+        unwrapped_all,
+        key=lambda t: (
+            str(_stix_get(t, "name") or ""),
+            str(_stix_get(t, "id") or ""),
+        ),
+    )
+    page_techniques, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        unwrapped_sorted, limit=limit, offset=offset
+    )
+
     out = []
-    unwrapped_techniques = []
-    for item in techniques:
-        tech = _unwrap_stix_object(item)
-        if tech is None:
-            continue
-        unwrapped_techniques.append(tech)
+    for tech in page_techniques:
         stix_id = _stix_get(tech, "id")
         try:
             attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
@@ -6116,15 +6900,26 @@ async def get_techniques_targeting_asset(
             }
         )
 
-    # Human-readable formatted block
-    formatted = format_objects(unwrapped_techniques, include_description=include_description, domain=domain)
+    formatted = (
+        format_objects(page_techniques, include_description=include_description, domain=domain)
+        if include_formatted
+        else ""
+    )
 
     return {
         "found": True,
         "count": len(out),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "techniques": out,
         "formatted": formatted,
-        "message": f"Found {len(out)} techniques targeting asset '{asset_stix_id}'.",
+        "message": (
+            f"Found {total_count} techniques targeting asset '{asset_stix_id}' "
+            f"(returning {len(out)} at offset {safe_offset})."
+        ),
     }
 
  #####################################################################
@@ -6136,20 +6931,23 @@ async def get_campaigns_using_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all campaigns that use a specific technique.
 
     This is a reverse lookup: Technique → Campaigns.
+    Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1190").
 
     Args:
-        technique_stix_id: Technique STIX UUID identifier
-                           (e.g., 'attack-pattern--UUID').
+        technique_stix_id: Technique STIX UUID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Whether to include campaign descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "technique": {
               "attack_id": "TXXXX or TXXXX.YYY" | null,
               "name": "<technique name or null>",
@@ -6163,6 +6961,7 @@ async def get_campaigns_using_technique(
             {
               "attack_id": "CXXXX" | null,
               "name": "<campaign name>",
+              "aliases": [...],
               "stix_id": "<campaign--UUID>",
               "description": "<text or null>",
               "relationships": [
@@ -6185,21 +6984,24 @@ async def get_campaigns_using_technique(
     """
     attack_data = get_attack_data(domain)
 
-    # Optional: resolve technique metadata for context
-    try:
-        tech_obj = attack_data.get_object_by_stix_id(technique_stix_id)
-    except Exception:
-        tech_obj = None
+    resolved_id, tech_obj, err = _resolve_stix_object(
+        technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "technique": None,
+            "count": 0,
+            "campaigns": [],
+            "formatted": "",
+            "message": err or f"Technique '{technique_stix_id}' not found in domain '{domain}'.",
+        }
+    technique_stix_id = resolved_id
 
     technique_info: Optional[Dict[str, Any]] = None
     if tech_obj is not None:
-        if isinstance(tech_obj, dict):
-            t_name = tech_obj.get("name")
-            t_desc = tech_obj.get("description") if include_description else None
-        else:
-            t_name = getattr(tech_obj, "name", None)
-            t_desc = getattr(tech_obj, "description", None) if include_description else None
-
+        t_name = _stix_get(tech_obj, "name")
+        t_desc = _stix_get(tech_obj, "description") if include_description else None
         try:
             t_attack_id = attack_data.get_attack_id(technique_stix_id)
         except Exception:
@@ -6212,7 +7014,6 @@ async def get_campaigns_using_technique(
             "description": t_desc,
         }
 
-    # Call MITRE library helper: campaigns using this technique
     try:
         rel_entries = attack_data.get_campaigns_using_technique(technique_stix_id)
     except Exception:
@@ -6220,6 +7021,7 @@ async def get_campaigns_using_technique(
 
     if not rel_entries:
         return {
+            "found": True,
             "technique": technique_info,
             "count": 0,
             "campaigns": [],
@@ -6234,8 +7036,6 @@ async def get_campaigns_using_technique(
     campaign_objects_for_format: List[Any] = []
 
     for entry in rel_entries:
-        # Many mitreattack helpers return RelationshipEntry-like dicts:
-        # { "object": <campaign>, "relationships": [<relationship>, ...] }
         if isinstance(entry, dict) and ("object" in entry or "relationships" in entry):
             camp_obj = entry.get("object", entry)
             rels = entry.get("relationships", [])
@@ -6248,25 +7048,16 @@ async def get_campaigns_using_technique(
 
         campaign_objects_for_format.append(camp_obj)
 
-        # Extract campaign fields
-        if isinstance(camp_obj, dict):
-            c_name = camp_obj.get("name")
-            c_stix_id = camp_obj.get("id")
-            c_aliases = camp_obj.get("aliases") or camp_obj.get("x_mitre_aliases") or []
-            c_desc = camp_obj.get("description") if include_description else None
-        else:
-            c_name = getattr(camp_obj, "name", None)
-            c_stix_id = getattr(camp_obj, "id", None)
-            c_aliases = getattr(camp_obj, "aliases", None) or getattr(camp_obj, "x_mitre_aliases", None) or []
-            c_desc = getattr(camp_obj, "description", None) if include_description else None
+        c_name = _stix_get(camp_obj, "name")
+        c_stix_id = _stix_get(camp_obj, "id")
+        c_aliases = _get_aliases(camp_obj)
+        c_desc = _stix_get(camp_obj, "description") if include_description else None
 
-        # External ATT&CK campaign ID (CXXXX)
         try:
-            c_attack_id = attack_data.get_attack_id(c_stix_id)
+            c_attack_id = attack_data.get_attack_id(c_stix_id) if c_stix_id else None
         except Exception:
             c_attack_id = None
 
-        # Relationship metadata (if available)
         relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         campaigns_structured.append(
@@ -6280,9 +7071,8 @@ async def get_campaigns_using_technique(
             }
         )
 
-    # Optional human-readable formatted output
     formatted = ""
-    if campaign_objects_for_format:
+    if include_formatted and campaign_objects_for_format:
         formatted = format_objects(
             campaign_objects_for_format,
             include_description=include_description,
@@ -6290,6 +7080,7 @@ async def get_campaigns_using_technique(
         )
 
     return {
+        "found": True,
         "technique": technique_info,
         "count": len(campaigns_structured),
         "campaigns": campaigns_structured,
@@ -6305,18 +7096,26 @@ async def get_techniques_used_by_campaign(
     campaign_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all techniques used in a specific campaign.
 
+    Accepts either a STIX ID ("campaign--UUID") or an ATT&CK ID (e.g., "C0024").
+
     Args:
-        campaign_stix_id: Campaign STIX UUID identifier
-                          (e.g., 'campaign--UUID').
+        campaign_stix_id: Campaign STIX UUID ("campaign--UUID") or ATT&CK ID (e.g., "C0024").
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Whether to include technique descriptions.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "campaign": {
               "attack_id": "CXXXX" | null,
               "name": "<campaign name or null>",
@@ -6324,7 +7123,12 @@ async def get_techniques_used_by_campaign(
               "description": "<text or null>",
           } | null,
 
-          "count": <number of techniques>,
+          "count": <number of techniques in this page>,
+          "total_count": <total number of techniques>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
 
           "techniques": [
             {
@@ -6352,22 +7156,31 @@ async def get_techniques_used_by_campaign(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # Optional: resolve campaign metadata
-    try:
-        camp_obj = attack_data.get_object_by_stix_id(campaign_stix_id)
-    except Exception:
-        camp_obj = None
+    resolved_id, camp_obj, err = _resolve_stix_object(
+        campaign_stix_id, domain=domain, expected_stix_type="campaign"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "campaign": None,
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "techniques": [],
+            "formatted": "",
+            "message": err or f"Campaign '{campaign_stix_id}' not found in domain '{domain}'.",
+        }
+    campaign_stix_id = resolved_id
 
     campaign_info: Optional[Dict[str, Any]] = None
     if camp_obj is not None:
-        if isinstance(camp_obj, dict):
-            c_name = camp_obj.get("name")
-            c_desc = camp_obj.get("description") if include_description else None
-        else:
-            c_name = getattr(camp_obj, "name", None)
-            c_desc = getattr(camp_obj, "description", None) if include_description else None
-
+        c_name = _stix_get(camp_obj, "name")
+        c_desc = _stix_get(camp_obj, "description") if include_description else None
         try:
             c_attack_id = attack_data.get_attack_id(campaign_stix_id)
         except Exception:
@@ -6380,7 +7193,6 @@ async def get_techniques_used_by_campaign(
             "description": c_desc,
         }
 
-    # Call MITRE helper: techniques used by this campaign
     try:
         rel_entries = attack_data.get_techniques_used_by_campaign(campaign_stix_id)
     except Exception:
@@ -6388,8 +7200,14 @@ async def get_techniques_used_by_campaign(
 
     if not rel_entries:
         return {
+            "found": True,
             "campaign": campaign_info,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": (
@@ -6398,52 +7216,43 @@ async def get_techniques_used_by_campaign(
             ),
         }
 
-    techniques_structured: List[Dict[str, Any]] = []
-    technique_objects_for_format: List[Any] = []
-
+    normalized_entries: List[Tuple[Any, List[Any]]] = []
     for entry in rel_entries:
-        # RelationshipEntry-style: {"object": <technique>, "relationships": [...]}
         if isinstance(entry, dict) and ("object" in entry or "relationships" in entry):
             tech_obj = entry.get("object", entry)
             rels = entry.get("relationships", [])
         else:
             tech_obj = entry
             rels = []
+        if tech_obj is not None:
+            normalized_entries.append((tech_obj, rels))
 
-        if tech_obj is None:
-            continue
+    normalized_entries.sort(
+        key=lambda pair: (
+            str(_stix_get(pair[0], "name") or ""),
+            str(_stix_get(pair[0], "id") or ""),
+        )
+    )
+    page_entries, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        normalized_entries, limit=limit, offset=offset
+    )
 
+    techniques_structured: List[Dict[str, Any]] = []
+    technique_objects_for_format: List[Any] = []
+
+    for tech_obj, rels in page_entries:
         technique_objects_for_format.append(tech_obj)
 
-        # Extract technique fields
-        if isinstance(tech_obj, dict):
-            t_name = tech_obj.get("name")
-            t_stix_id = tech_obj.get("id")
-            t_desc = tech_obj.get("description") if include_description else None
-            phases = tech_obj.get("kill_chain_phases", []) or []
-        else:
-            t_name = getattr(tech_obj, "name", None)
-            t_stix_id = getattr(tech_obj, "id", None)
-            t_desc = getattr(tech_obj, "description", None) if include_description else None
-            phases = getattr(tech_obj, "kill_chain_phases", []) or []
+        t_name = _stix_get(tech_obj, "name")
+        t_stix_id = _stix_get(tech_obj, "id")
+        t_desc = _stix_get(tech_obj, "description") if include_description else None
+        tactics = _extract_tactic_names(tech_obj)
 
-        # ATT&CK technique ID
         try:
-            t_attack_id = attack_data.get_attack_id(t_stix_id)
+            t_attack_id = attack_data.get_attack_id(t_stix_id) if t_stix_id else None
         except Exception:
             t_attack_id = None
 
-        # Tactics from kill_chain_phases
-        tactics: List[str] = []
-        for p in phases:
-            if isinstance(p, dict):
-                phase_name = p.get("phase_name")
-            else:
-                phase_name = getattr(p, "phase_name", None)
-            if phase_name:
-                tactics.append(phase_name.replace("-", " ").title())
-
-        # Relationship metadata
         relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         techniques_structured.append(
@@ -6457,9 +7266,8 @@ async def get_techniques_used_by_campaign(
             }
         )
 
-    # Optional human-readable formatted block
     formatted = ""
-    if technique_objects_for_format:
+    if include_formatted and technique_objects_for_format:
         formatted = format_objects(
             technique_objects_for_format,
             include_description=include_description,
@@ -6467,13 +7275,20 @@ async def get_techniques_used_by_campaign(
         )
 
     return {
+        "found": True,
         "campaign": campaign_info,
         "count": len(techniques_structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "techniques": techniques_structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(techniques_structured)} technique(s) used by campaign "
-            f"STIX ID '{campaign_stix_id}' in domain '{domain}'."
+            f"Found {total_count} technique(s) used by campaign "
+            f"STIX ID '{campaign_stix_id}' in domain '{domain}' "
+            f"(returning {len(techniques_structured)} at offset {safe_offset})."
         ),
     }
 
@@ -6482,19 +7297,23 @@ async def get_campaigns_using_software(
     software_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all campaigns that use specific software/malware.
 
     This is a reverse lookup: Software → Campaigns.
+    Accepts either a STIX ID ("malware--UUID", "tool--UUID") or an ATT&CK ID (e.g., "S0154").
 
     Args:
-        software_stix_id: Software STIX UUID identifier (e.g., 'malware--UUID', 'tool--UUID').
+        software_stix_id: Software STIX UUID ("malware--UUID", "tool--UUID") or ATT&CK ID (e.g., "S0154").
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Whether to include campaign descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "software": {
               "attack_id": "SXXXX or similar" | null,
               "name": "<software name or null>",
@@ -6509,6 +7328,7 @@ async def get_campaigns_using_software(
             {
               "attack_id": "CXXXX" | null,
               "name": "<campaign name>",
+              "aliases": [...],
               "stix_id": "<campaign--UUID>",
               "description": "<text or null>",
               "relationships": [
@@ -6531,23 +7351,25 @@ async def get_campaigns_using_software(
     """
     attack_data = get_attack_data(domain)
 
-    # Optional: resolve software metadata for context
-    try:
-        sw_obj = attack_data.get_object_by_stix_id(software_stix_id)
-    except Exception:
-        sw_obj = None
+    resolved_id, sw_obj, err = _resolve_stix_object(
+        software_stix_id, domain=domain, expected_stix_type=("malware", "tool")
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "software": None,
+            "count": 0,
+            "campaigns": [],
+            "formatted": "",
+            "message": err or f"Software '{software_stix_id}' not found in domain '{domain}'.",
+        }
+    software_stix_id = resolved_id
 
     software_info = None
     if sw_obj is not None:
-        if isinstance(sw_obj, dict):
-            s_name = sw_obj.get("name")
-            s_type = sw_obj.get("type")
-            s_desc = sw_obj.get("description") if include_description else None
-        else:
-            s_name = getattr(sw_obj, "name", None)
-            s_type = getattr(sw_obj, "type", None)
-            s_desc = getattr(sw_obj, "description", None) if include_description else None
-
+        s_name = _stix_get(sw_obj, "name")
+        s_type = _stix_get(sw_obj, "type")
+        s_desc = _stix_get(sw_obj, "description") if include_description else None
         try:
             s_attack_id = attack_data.get_attack_id(software_stix_id)
         except Exception:
@@ -6561,7 +7383,6 @@ async def get_campaigns_using_software(
             "description": s_desc,
         }
 
-    # Call MITRE helper: campaigns using this software
     try:
         rel_entries = attack_data.get_campaigns_using_software(software_stix_id)
     except Exception:
@@ -6569,6 +7390,7 @@ async def get_campaigns_using_software(
 
     if not rel_entries:
         return {
+            "found": True,
             "software": software_info,
             "count": 0,
             "campaigns": [],
@@ -6583,7 +7405,6 @@ async def get_campaigns_using_software(
     campaign_objects_for_format: List[Any] = []
 
     for entry in rel_entries:
-        # RelationshipEntry-style: {"object": <campaign>, "relationships": [...]}
         if isinstance(entry, dict) and ("object" in entry or "relationships" in entry):
             camp_obj = entry.get("object", entry)
             rels = entry.get("relationships", [])
@@ -6596,25 +7417,16 @@ async def get_campaigns_using_software(
 
         campaign_objects_for_format.append(camp_obj)
 
-        # Extract campaign fields
-        if isinstance(camp_obj, dict):
-            c_name = camp_obj.get("name")
-            c_stix_id = camp_obj.get("id")
-            c_aliases = camp_obj.get("aliases") or camp_obj.get("x_mitre_aliases") or []
-            c_desc = camp_obj.get("description") if include_description else None
-        else:
-            c_name = getattr(camp_obj, "name", None)
-            c_stix_id = getattr(camp_obj, "id", None)
-            c_aliases = getattr(camp_obj, "aliases", None) or getattr(camp_obj, "x_mitre_aliases", None) or []
-            c_desc = getattr(camp_obj, "description", None) if include_description else None
+        c_name = _stix_get(camp_obj, "name")
+        c_stix_id = _stix_get(camp_obj, "id")
+        c_aliases = _get_aliases(camp_obj)
+        c_desc = _stix_get(camp_obj, "description") if include_description else None
 
-        # External ATT&CK campaign ID (CXXXX)
         try:
-            c_attack_id = attack_data.get_attack_id(c_stix_id)
+            c_attack_id = attack_data.get_attack_id(c_stix_id) if c_stix_id else None
         except Exception:
             c_attack_id = None
 
-        # Relationship metadata
         relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         campaigns_structured.append(
@@ -6628,9 +7440,8 @@ async def get_campaigns_using_software(
             }
         )
 
-    # Optional human-readable formatted output
     formatted = ""
-    if campaign_objects_for_format:
+    if include_formatted and campaign_objects_for_format:
         formatted = format_objects(
             campaign_objects_for_format,
             include_description=include_description,
@@ -6638,6 +7449,7 @@ async def get_campaigns_using_software(
         )
 
     return {
+        "found": True,
         "software": software_info,
         "count": len(campaigns_structured),
         "campaigns": campaigns_structured,
@@ -6653,17 +7465,22 @@ async def get_software_used_by_campaign(
     campaign_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all software/malware used in a specific campaign.
 
+    Accepts either a STIX ID ("campaign--UUID") or an ATT&CK ID (e.g., "C0024").
+
     Args:
-        campaign_stix_id: Campaign STIX UUID identifier (e.g., 'campaign--UUID').
+        campaign_stix_id: Campaign STIX UUID ('campaign--UUID') or ATT&CK ID (e.g., 'C0024').
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Whether to include software descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "campaign": {
               "attack_id": "CXXXX" | null,
               "name": "<campaign name or null>",
@@ -6701,21 +7518,24 @@ async def get_software_used_by_campaign(
     """
     attack_data = get_attack_data(domain)
 
-    # Resolve campaign metadata for context
-    try:
-        camp_obj = attack_data.get_object_by_stix_id(campaign_stix_id)
-    except Exception:
-        camp_obj = None
+    resolved_id, camp_obj, err = _resolve_stix_object(
+        campaign_stix_id, domain=domain, expected_stix_type="campaign"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "campaign": None,
+            "count": 0,
+            "software": [],
+            "formatted": "",
+            "message": err or f"Campaign '{campaign_stix_id}' not found in domain '{domain}'.",
+        }
+    campaign_stix_id = resolved_id
 
     campaign_info = None
     if camp_obj is not None:
-        if isinstance(camp_obj, dict):
-            c_name = camp_obj.get("name")
-            c_desc = camp_obj.get("description") if include_description else None
-        else:
-            c_name = getattr(camp_obj, "name", None)
-            c_desc = getattr(camp_obj, "description", None) if include_description else None
-
+        c_name = _stix_get(camp_obj, "name")
+        c_desc = _stix_get(camp_obj, "description") if include_description else None
         try:
             c_attack_id = attack_data.get_attack_id(campaign_stix_id)
         except Exception:
@@ -6728,7 +7548,6 @@ async def get_software_used_by_campaign(
             "description": c_desc,
         }
 
-    # Call MITRE helper: software used by this campaign
     try:
         rel_entries = attack_data.get_software_used_by_campaign(campaign_stix_id)
     except Exception:
@@ -6736,6 +7555,7 @@ async def get_software_used_by_campaign(
 
     if not rel_entries:
         return {
+            "found": True,
             "campaign": campaign_info,
             "count": 0,
             "software": [],
@@ -6750,7 +7570,6 @@ async def get_software_used_by_campaign(
     software_objects_for_format: List[Any] = []
 
     for entry in rel_entries:
-        # Expected: {"object": <software>, "relationships": [...]}
         if isinstance(entry, dict) and ("object" in entry or "relationships" in entry):
             sw_obj = entry.get("object", entry)
             rels = entry.get("relationships", [])
@@ -6763,27 +7582,17 @@ async def get_software_used_by_campaign(
 
         software_objects_for_format.append(sw_obj)
 
-        # Extract software fields
-        if isinstance(sw_obj, dict):
-            s_name = sw_obj.get("name")
-            s_stix_id = sw_obj.get("id")
-            s_type = sw_obj.get("type")
-            s_aliases = sw_obj.get("aliases", [])
-            s_desc = sw_obj.get("description") if include_description else None
-        else:
-            s_name = getattr(sw_obj, "name", None)
-            s_stix_id = getattr(sw_obj, "id", None)
-            s_type = getattr(sw_obj, "type", None)
-            s_aliases = getattr(sw_obj, "aliases", [])
-            s_desc = getattr(sw_obj, "description", None) if include_description else None
+        s_name = _stix_get(sw_obj, "name")
+        s_stix_id = _stix_get(sw_obj, "id")
+        s_type = _stix_get(sw_obj, "type")
+        s_aliases = _get_aliases(sw_obj)
+        s_desc = _stix_get(sw_obj, "description") if include_description else None
 
-        # External ATT&CK software ID (often SXXXX)
         try:
-            s_attack_id = attack_data.get_attack_id(s_stix_id)
+            s_attack_id = attack_data.get_attack_id(s_stix_id) if s_stix_id else None
         except Exception:
             s_attack_id = None
 
-        # Relationship metadata
         relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
 
         software_structured.append(
@@ -6798,9 +7607,8 @@ async def get_software_used_by_campaign(
             }
         )
 
-    # Optional human-readable formatted output
     formatted = ""
-    if software_objects_for_format:
+    if include_formatted and software_objects_for_format:
         formatted = format_objects(
             software_objects_for_format,
             include_description=include_description,
@@ -6808,6 +7616,7 @@ async def get_software_used_by_campaign(
         )
 
     return {
+        "found": True,
         "campaign": campaign_info,
         "count": len(software_structured),
         "software": software_structured,
@@ -6845,6 +7654,7 @@ async def get_techniques_by_platform(
             description="Zero-based starting index for pagination (>= 0).",
         ),
     ] = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK techniques that apply to a specific platform.
@@ -6980,10 +7790,14 @@ async def get_techniques_by_platform(
         )
 
     # optional human-readable formatting
-    formatted = format_objects(
-        page_techniques,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_techniques,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
@@ -7008,17 +7822,23 @@ async def get_parent_technique_of_subtechnique(
     technique_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get the parent technique of a subtechnique.
 
+    Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1566.002").
+
     Args:
-        technique_stix_id: STIX UUID of the subtechnique.
+        technique_stix_id: STIX UUID or ATT&CK ID (e.g., "T1566.002") of the subtechnique.
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Whether to include the parent's description.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
+          "count": int,
           "subtechnique_stix_id": "...",
           "subtechnique_attack_id": "Txxxx.xxx" or null,
           "parent": {
@@ -7033,13 +7853,26 @@ async def get_parent_technique_of_subtechnique(
     """
     attack_data = get_attack_data(domain)
 
-    # First: resolve ATT&CK ID of the subtechnique
+    resolved_id, _sub_obj, err = _resolve_stix_object(
+        technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "count": 0,
+            "subtechnique_stix_id": technique_stix_id,
+            "subtechnique_attack_id": None,
+            "parent": None,
+            "formatted": "",
+            "message": err or f"Subtechnique '{technique_stix_id}' not found in domain '{domain}'.",
+        }
+    technique_stix_id = resolved_id
+
     try:
         sub_attack_id = attack_data.get_attack_id(technique_stix_id)
     except Exception:
         sub_attack_id = None
 
-    # Try retrieving the parent entry / STIX ID
     try:
         parent_raw = attack_data.get_parent_technique_of_subtechnique(technique_stix_id)
     except Exception:
@@ -7057,6 +7890,8 @@ async def get_parent_technique_of_subtechnique(
 
     if parent_obj is None or not parent_stix_id:
         return {
+            "found": False,
+            "count": 0,
             "subtechnique_stix_id": technique_stix_id,
             "subtechnique_attack_id": sub_attack_id,
             "parent": None,
@@ -7067,7 +7902,6 @@ async def get_parent_technique_of_subtechnique(
             ),
         }
 
-    # Extract parent attributes
     parent_name = _stix_get(parent_obj, "name")
     parent_desc = _stix_get(parent_obj, "description") if include_description else None
 
@@ -7076,14 +7910,19 @@ async def get_parent_technique_of_subtechnique(
     except Exception:
         parent_attack_id = None
 
-    # Human-readable formatting
-    formatted = format_objects(
-        [parent_obj],
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            [parent_obj],
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
+        "found": True,
+        "count": 1,
         "subtechnique_stix_id": technique_stix_id,
         "subtechnique_attack_id": sub_attack_id,
         "parent": {
@@ -7104,22 +7943,27 @@ async def get_subtechniques_of_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = False,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all subtechniques of a parent technique.
 
+    Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1566").
+
     Args:
-        technique_stix_id: STIX UUID of the parent technique.
+        technique_stix_id: STIX UUID or ATT&CK ID (e.g., "T1566") of the parent technique.
         domain: ATT&CK domain.
         include_description: Whether to include subtechnique descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "parent": {
               "stix_id": "...",
               "attack_id": "...",
               "name": "..."
-          },
+          } | null,
           "count": int,
           "subtechniques": [
               {
@@ -7136,16 +7980,27 @@ async def get_subtechniques_of_technique(
     """
     attack_data = get_attack_data(domain)
 
-    # Resolve parent attributes
+    resolved_id, parent_obj, err = _resolve_stix_object(
+        technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "parent": None,
+            "count": 0,
+            "subtechniques": [],
+            "formatted": "",
+            "message": err or f"Technique '{technique_stix_id}' not found in domain '{domain}'.",
+        }
+    technique_stix_id = resolved_id
+
     try:
         parent_attack_id = attack_data.get_attack_id(technique_stix_id)
     except Exception:
         parent_attack_id = None
 
-    parent_obj = attack_data.get_object_by_stix_id(technique_stix_id)
-    parent_name = getattr(parent_obj, "name", None) if parent_obj else None
+    parent_name = _stix_get(parent_obj, "name") if parent_obj is not None else None
 
-    # Retrieve subtechniques
     try:
         subs = attack_data.get_subtechniques_of_technique(technique_stix_id) or []
     except Exception:
@@ -7153,6 +8008,7 @@ async def get_subtechniques_of_technique(
 
     if not subs:
         return {
+            "found": True,
             "parent": {
                 "stix_id": technique_stix_id,
                 "attack_id": parent_attack_id,
@@ -7167,7 +8023,6 @@ async def get_subtechniques_of_technique(
             ),
         }
 
-    # Convert subtechniques to structured form
     sub_list = []
     unwrapped_subs = []
     for item in subs:
@@ -7192,14 +8047,18 @@ async def get_subtechniques_of_technique(
             }
         )
 
-    # Human-readable formatting
-    formatted = format_objects(
-        unwrapped_subs,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            unwrapped_subs,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
+        "found": True,
         "parent": {
             "stix_id": technique_stix_id,
             "attack_id": parent_attack_id,
@@ -7223,14 +8082,20 @@ async def get_techniques_mitigated_by_mitigation(
     mitigation_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = False,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
-    Get all techniques mitigated by a specific mitigation (by STIX ID).
+    Get all techniques mitigated by a specific mitigation (by STIX ID or ATT&CK ID).
 
     Args:
-        mitigation_stix_id: STIX UUID of the mitigation (e.g., course-of-action--UUID).
+        mitigation_stix_id: STIX UUID ("course-of-action--UUID") or ATT&CK ID (e.g., "M1051").
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Include technique descriptions in the output.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
@@ -7241,6 +8106,11 @@ async def get_techniques_mitigated_by_mitigation(
               "stix_id": "course-of-action--..."
           } | null,
           "count": int,
+          "total_count": int,
+          "offset": int,
+          "limit": int,
+          "has_more": bool,
+          "next_offset": int | null,
           "techniques": [
               {
                   "attack_id": "Txxxx",
@@ -7255,29 +8125,35 @@ async def get_techniques_mitigated_by_mitigation(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # --- Resolve the mitigation object ---
-    mitigation_obj = attack_data.get_object_by_stix_id(mitigation_stix_id)
-    if mitigation_obj is None:
+    resolved_id, mitigation_obj, err = _resolve_stix_object(
+        mitigation_stix_id, domain=domain, expected_stix_type="course-of-action"
+    )
+    if resolved_id is None or mitigation_obj is None:
         return {
             "found": False,
             "mitigation": None,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
-            "message": (
-                f"Mitigation STIX ID '{mitigation_stix_id}' not found in "
-                f"domain '{domain}'."
+            "message": err or (
+                f"Mitigation '{mitigation_stix_id}' not found in domain '{domain}'."
             ),
         }
+    mitigation_stix_id = resolved_id
 
-    mitigation_name = getattr(mitigation_obj, "name", None)
+    mitigation_name = _stix_get(mitigation_obj, "name")
     try:
         mitigation_attack_id = attack_data.get_attack_id(mitigation_stix_id)
     except Exception:
         mitigation_attack_id = None
 
-    # --- Fetch techniques mitigated by this mitigation ---
     try:
         techniques = attack_data.get_techniques_mitigated_by_mitigation(
             mitigation_stix_id
@@ -7294,6 +8170,11 @@ async def get_techniques_mitigated_by_mitigation(
                 "stix_id": mitigation_stix_id,
             },
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": (
@@ -7302,14 +8183,22 @@ async def get_techniques_mitigated_by_mitigation(
             ),
         }
 
-    # --- Build list of technique entries ---
+    unwrapped_all = [
+        t for t in (_unwrap_stix_object(item) for item in techniques) if t is not None
+    ]
+    unwrapped_sorted = sorted(
+        unwrapped_all,
+        key=lambda t: (
+            str(_stix_get(t, "name") or ""),
+            str(_stix_get(t, "id") or ""),
+        ),
+    )
+    page_techs, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        unwrapped_sorted, limit=limit, offset=offset
+    )
+
     technique_entries = []
-    unwrapped_techs = []
-    for item in techniques:
-        t = _unwrap_stix_object(item)
-        if t is None:
-            continue
-        unwrapped_techs.append(t)
+    for t in page_techs:
         stix_id = _stix_get(t, "id")
         name = _stix_get(t, "name")
         desc = _stix_get(t, "description") if include_description else None
@@ -7328,10 +8217,14 @@ async def get_techniques_mitigated_by_mitigation(
             }
         )
 
-    formatted = format_objects(
-        unwrapped_techs,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_techs,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
@@ -7342,29 +8235,38 @@ async def get_techniques_mitigated_by_mitigation(
             "stix_id": mitigation_stix_id,
         },
         "count": len(technique_entries),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "techniques": technique_entries,
         "formatted": formatted,
         "message": (
-            f"Found {len(technique_entries)} techniques mitigated by "
-            f"'{mitigation_attack_id}' ({mitigation_name})."
+            f"Found {total_count} techniques mitigated by "
+            f"'{mitigation_attack_id}' ({mitigation_name}) "
+            f"(returning {len(technique_entries)} at offset {safe_offset})."
         ),
     }
 
-
-from typing import Any, Dict, List, Optional
 
 @mcp.tool()
 async def get_mitigations_mitigating_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = False,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all mitigations that address a specific technique.
 
-    Helper returns: list[RelationshipEntry[Mitigation]]
-    So each item is a wrapper that contains a Mitigation object (usually in `.object`).
-    We must unwrap before extracting fields.
+    Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1190").
+
+    Args:
+        technique_stix_id: Technique STIX ID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        include_description: Include mitigation descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns (same schema as before):
       {
@@ -7378,16 +8280,21 @@ async def get_mitigations_mitigating_technique(
     """
     attack_data = get_attack_data(domain)
 
-    # --- Resolve technique context ---
-    try:
-        technique_obj = attack_data.get_object_by_stix_id(technique_stix_id)
-    except Exception:
-        technique_obj = None
+    resolved_id, technique_obj, err = _resolve_stix_object(
+        technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "technique": None,
+            "count": 0,
+            "mitigations": [],
+            "formatted": "",
+            "message": err or f"Technique '{technique_stix_id}' not found in domain '{domain}'.",
+        }
+    technique_stix_id = resolved_id
 
-    if isinstance(technique_obj, dict):
-        t_name = technique_obj.get("name")
-    else:
-        t_name = getattr(technique_obj, "name", None) if technique_obj is not None else None
+    t_name = _stix_get(technique_obj, "name") if technique_obj is not None else None
 
     try:
         t_attack_id = attack_data.get_attack_id(technique_stix_id)
@@ -7400,7 +8307,6 @@ async def get_mitigations_mitigating_technique(
         "stix_id": technique_stix_id,
     }
 
-    # --- Fetch relationship entries from MITRE helper ---
     try:
         rel_entries = attack_data.get_mitigations_mitigating_technique(technique_stix_id) or []
     except Exception:
@@ -7419,40 +8325,18 @@ async def get_mitigations_mitigating_technique(
             ),
         }
 
-    def _unwrap_mitigation(entry: Any) -> Any:
-        """
-        RelationshipEntry[Mitigation] usually stores the Mitigation in `.object`.
-        Some implementations may store it in dict["object"].
-        """
-        # RelationshipEntry object with attribute `.object`
-        if hasattr(entry, "object"):
-            return getattr(entry, "object")
-
-        # Dict-like wrapper
-        if isinstance(entry, dict):
-            if isinstance(entry.get("object"), (dict, object)):
-                return entry.get("object")
-
-        # If it's already a mitigation (unexpected, but safe)
-        return entry
-
     mitigation_objects: List[Any] = []
     for e in rel_entries:
-        m = _unwrap_mitigation(e)
+        m = _unwrap_stix_object(e)
         if m is None:
             continue
         mitigation_objects.append(m)
 
     mitigation_entries: List[Dict[str, Any]] = []
     for m in mitigation_objects:
-        if isinstance(m, dict):
-            m_name = m.get("name")
-            m_stix = m.get("id")  # STIX ID for course-of-action
-            m_desc = m.get("description") if include_description else None
-        else:
-            m_name = getattr(m, "name", None)
-            m_stix = getattr(m, "id", None)
-            m_desc = getattr(m, "description", None) if include_description else None
+        m_name = _stix_get(m, "name")
+        m_stix = _stix_get(m, "id")
+        m_desc = _stix_get(m, "description") if include_description else None
 
         try:
             m_attack_id = attack_data.get_attack_id(m_stix) if m_stix else None
@@ -7468,14 +8352,16 @@ async def get_mitigations_mitigating_technique(
             }
         )
 
-    # Format using actual mitigation objects (not relationship entries)
-    formatted = format_objects(
-        mitigation_objects,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            mitigation_objects,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
-    # Filter out empty rows if any (defensive)
     mitigation_entries = [
         x for x in mitigation_entries
         if x.get("name") or x.get("stix_id") or x.get("attack_id")
@@ -7503,28 +8389,46 @@ def get_datacomponents_detecting_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = False,
+    include_formatted: bool = True,
 ) -> dict:
     """
     Get all data components that can detect a specific technique.
+
+    Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1059.001").
 
     Primary mode:
       - Use mitreattack-python relationship traversal (if present)
 
     Fallback mode (when relationship traversal yields 0):
-      - Read technique.x_mitre_data_sources (strings)
-      - Resolve data source objects by name
-      - Return data components whose x_mitre_data_source_ref points to those data sources
-      - If the string includes a component name (e.g., "Process: Process Creation"),
-        filter to that component when possible.
+      - Traverse ATT&CK v20.1 DetectionStrategy -> Analytic -> DataComponent graph
+      - Fallback to legacy technique.x_mitre_data_sources strings if needed
 
-    Returns the same structure as before, plus a debug block.
+    Args:
+        technique_stix_id: Technique STIX ID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1059.001").
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        include_description: Whether to include descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
     """
     attack_data = get_attack_data(domain)
+
+    resolved_id, tech_obj, err = _resolve_stix_object(
+        technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "technique": None,
+            "count": 0,
+            "datacomponents": [],
+            "detection_strategies": [],
+            "formatted": "",
+            "message": err or f"Technique '{technique_stix_id}' not found in domain '{domain}'.",
+        }
+    technique_stix_id = resolved_id
 
     def _get_attr(obj, name, default=None):
         if obj is None:
             return default
-        # support both dict and STIX objects
         if isinstance(obj, dict):
             return obj.get(name, default)
         return getattr(obj, name, default)
@@ -7547,13 +8451,6 @@ def get_datacomponents_detecting_technique(
             "stix_id": stix_id,
             "description": desc if include_description else None,
         }
-
-    # ---------- 1) Load technique ----------
-    tech_obj = None
-    try:
-        tech_obj = attack_data.get_object_by_stix_id(technique_stix_id)
-    except Exception:
-        tech_obj = None
 
     technique_info = _technique_info(tech_obj) if tech_obj else None
 
@@ -7765,8 +8662,7 @@ def get_datacomponents_detecting_technique(
 
     # ---------- 4) formatted (optional) ----------
     formatted = ""
-    if datacomponents_structured:
-        # keep it simple / readable
+    if include_formatted and datacomponents_structured:
         formatted_lines = []
         for dc in datacomponents_structured:
             ds_part = f" ({dc['data_source_name']})" if dc.get("data_source_name") else ""
@@ -7785,6 +8681,7 @@ def get_datacomponents_detecting_technique(
     )
 
     return {
+        "found": True,
         "technique": technique_info,
         "count": len(datacomponents_structured),
         "datacomponents": datacomponents_structured,
@@ -7799,39 +8696,31 @@ async def get_techniques_detected_by_datacomponent(
     datacomponent_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
-    limit: Annotated[
-        int,
-        Field(
-            default=DEFAULT_PAGE_LIMIT,
-            ge=1,
-            le=MAX_PAGE_LIMIT,
-            description=f"Maximum number of items to return per page (1-{MAX_PAGE_LIMIT}).",
-        ),
-    ] = DEFAULT_PAGE_LIMIT,
-    offset: Annotated[
-        int,
-        Field(
-            default=0,
-            ge=0,
-            description="Zero-based starting index for pagination (>= 0).",
-        ),
-    ] = 0,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all techniques that can be detected by a specific data component.
 
     Shows which adversary techniques can be identified by monitoring
-    this specific aspect of telemetry.
+    this specific aspect of telemetry. Accepts either a STIX ID
+    ("x-mitre-data-component--UUID") or an ATT&CK ID (e.g., "DC0032").
 
     Args:
-        datacomponent_stix_id: Data component STIX UUID identifier
-                               (e.g., 'x-mitre-data-component--UUID').
+        datacomponent_stix_id: Data component STIX UUID ('x-mitre-data-component--UUID')
+                               or ATT&CK ID (e.g., 'DC0032').
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Whether to include technique descriptions.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "datacomponent": {
+              "attack_id": "<DCxxxx or null>",
               "name": "<data component name or null>",
               "stix_id": "<x-mitre-data-component--UUID>",
               "description": "<text or null>",
@@ -7840,7 +8729,12 @@ async def get_techniques_detected_by_datacomponent(
               "data_source_attack_id": "<data source ATT&CK ID or null>",
           } | null,
 
-          "count": <number of techniques>,
+          "count": <number of techniques in this page>,
+          "total_count": <total number of techniques>,
+          "offset": <offset>,
+          "limit": <limit>,
+          "has_more": <bool>,
+          "next_offset": <int or null>,
 
           "techniques": [
             {
@@ -7857,30 +8751,32 @@ async def get_techniques_detected_by_datacomponent(
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # --- Resolve data component metadata ---
-    try:
-        dc_obj = attack_data.get_object_by_stix_id(datacomponent_stix_id)
-    except Exception:
-        dc_obj = None
+    resolved_id, dc_obj, err = _resolve_stix_object(
+        datacomponent_stix_id, domain=domain, expected_stix_type="x-mitre-data-component"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "datacomponent": None,
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "techniques": [],
+            "formatted": "",
+            "message": err or f"Data component '{datacomponent_stix_id}' not found in domain '{domain}'.",
+        }
+    datacomponent_stix_id = resolved_id
 
     datacomponent_info: Optional[Dict[str, Any]] = None
-    dc_for_format: Optional[Any] = None
-
     if dc_obj is not None:
-        dc_for_format = dc_obj
-
-        if isinstance(dc_obj, dict):
-            dc_name = dc_obj.get("name")
-            dc_desc = dc_obj.get("description") if include_description else None
-            ds_ref = (
-                dc_obj.get("x_mitre_data_source_ref")
-                or dc_obj.get("x-mitre-data-source-ref")
-            )
-        else:
-            dc_name = getattr(dc_obj, "name", None)
-            dc_desc = getattr(dc_obj, "description", None) if include_description else None
-            ds_ref = getattr(dc_obj, "x_mitre_data_source_ref", None)
+        dc_name = _stix_get(dc_obj, "name")
+        dc_desc = _stix_get(dc_obj, "description") if include_description else None
+        ds_ref = _stix_get(dc_obj, "x_mitre_data_source_ref") or _stix_get(dc_obj, "x-mitre-data-source-ref")
 
         data_source_stix_id = ds_ref
         data_source_name = None
@@ -7893,16 +8789,10 @@ async def get_techniques_detected_by_datacomponent(
                 ds_obj = None
 
             if ds_obj is not None:
-                if isinstance(ds_obj, dict):
-                    ds_name = ds_obj.get("name")
-                    ds_internal_id = ds_obj.get("id")
-                else:
-                    ds_name = getattr(ds_obj, "name", None)
-                    ds_internal_id = getattr(ds_obj, "id", None)
-
-                data_source_name = ds_name
+                data_source_name = _stix_get(ds_obj, "name")
+                ds_internal_id = _stix_get(ds_obj, "id")
                 try:
-                    data_source_attack_id = attack_data.get_attack_id(ds_internal_id)
+                    data_source_attack_id = attack_data.get_attack_id(ds_internal_id) if ds_internal_id else None
                 except Exception:
                     data_source_attack_id = None
 
@@ -7921,7 +8811,6 @@ async def get_techniques_detected_by_datacomponent(
             "data_source_attack_id": data_source_attack_id,
         }
 
-    # --- Fetch techniques detected by this data component ---
     try:
         techniques = attack_data.get_techniques_detected_by_datacomponent(
             datacomponent_stix_id
@@ -7940,8 +8829,8 @@ async def get_techniques_detected_by_datacomponent(
                 continue
 
     if not techniques:
-        safe_limit, safe_offset = _validate_pagination(limit, offset)
         return {
+            "found": True,
             "datacomponent": datacomponent_info,
             "count": 0,
             "total_count": 0,
@@ -7968,20 +8857,13 @@ async def get_techniques_detected_by_datacomponent(
         techniques_sorted, limit=limit, offset=offset
     )
 
-    # --- Let's build structured list of techniques ---
     technique_entries: List[Dict[str, Any]] = []
     for t in page_techniques:
-        if isinstance(t, dict):
-            t_name = t.get("name")
-            t_stix = t.get("id")
-            t_desc = t.get("description") if include_description else None
-        else:
-            t_name = getattr(t, "name", None)
-            t_stix = getattr(t, "id", None)
-            t_desc = getattr(t, "description", None) if include_description else None
-
+        t_name = _stix_get(t, "name")
+        t_stix = _stix_get(t, "id")
+        t_desc = _stix_get(t, "description") if include_description else None
         try:
-            t_attack_id = attack_data.get_attack_id(t_stix)
+            t_attack_id = attack_data.get_attack_id(t_stix) if t_stix else None
         except Exception:
             t_attack_id = None
 
@@ -7994,9 +8876,8 @@ async def get_techniques_detected_by_datacomponent(
             }
         )
 
-    # --- Optional human-readable formatted output. Can be silent if needed ---
     formatted = ""
-    if page_techniques:
+    if include_formatted and page_techniques:
         formatted = format_objects(
             page_techniques,
             include_description=include_description,
@@ -8004,6 +8885,7 @@ async def get_techniques_detected_by_datacomponent(
         )
 
     return {
+        "found": True,
         "datacomponent": datacomponent_info,
         "count": len(technique_entries),
         "total_count": total_count,
@@ -8029,55 +8911,69 @@ async def get_procedure_examples_by_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
-    Get procedure examples showing how threat groups used a specific technique.
+    Get procedure examples showing how threat groups, software, or campaigns used a specific technique.
 
     Procedure examples describe real incident behavior tied to this technique.
+    Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1190").
 
     Args:
-        technique_stix_id: STIX UUID of the technique
-        domain: ATT&CK domain
-        include_description: Include descriptions of the examples if available
+        technique_stix_id: STIX UUID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
+        domain: ATT&CK domain.
+        include_description: Include descriptions of the examples if available.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
+          "found": bool,
           "technique": {
               "attack_id": "Txxxx",
               "name": "...",
               "stix_id": "attack-pattern--UUID"
-          },
-          "count": N,
-          "examples": [
-              {
-                "relationship_id": "relationship--UUID",
-                "source_group_attack_id": "Gxxxx",
-                "source_group_name": "...",
-                "description": "...",
-                "stix_id": "relationship--UUID"
-              },
-              ...
-          ],
+          } | null,
+          "count": int,
+          "total_count": int,
+          "offset": int,
+          "limit": int,
+          "has_more": bool,
+          "next_offset": int | null,
+          "examples": [...],
           "formatted": "<multi-line readable text>",
           "message": "<summary>"
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # --- Resolve technique metadata ---
+    resolved_id, tech_obj, err = _resolve_stix_object(
+        technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "technique": None,
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "examples": [],
+            "formatted": "",
+            "message": err or f"Technique '{technique_stix_id}' not found in domain '{domain}'.",
+        }
+    technique_stix_id = resolved_id
+
+    tech_name = _stix_get(tech_obj, "name") if tech_obj is not None else None
     try:
-        tech_obj = attack_data.get_object_by_stix_id(technique_stix_id)
+        tech_attack_id = attack_data.get_attack_id(technique_stix_id)
     except Exception:
-        tech_obj = None
-
-    if tech_obj:
-        tech_name = getattr(tech_obj, "name", None)
-        try:
-            tech_attack_id = attack_data.get_attack_id(technique_stix_id)
-        except Exception:
-            tech_attack_id = None
-    else:
-        tech_name = None
         tech_attack_id = None
 
     technique_info = {
@@ -8086,7 +8982,6 @@ async def get_procedure_examples_by_technique(
         "stix_id": technique_stix_id,
     }
 
-    # --- Retrieve procedure examples ---
     try:
         examples = attack_data.get_procedure_examples_by_technique(
             technique_stix_id
@@ -8096,8 +8991,14 @@ async def get_procedure_examples_by_technique(
 
     if not examples:
         return {
+            "found": True,
             "technique": technique_info,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "examples": [],
             "formatted": "",
             "message": (
@@ -8106,16 +9007,21 @@ async def get_procedure_examples_by_technique(
             ),
         }
 
-    # --- Parse examples ---
+    examples_sorted = sorted(
+        examples,
+        key=lambda r: (
+            str(_stix_get(r, "source_ref") or ""),
+            str(_stix_get(r, "id") or ""),
+        ),
+    )
+    page_examples, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        examples_sorted, limit=limit, offset=offset
+    )
+
     example_entries = []
-    for rel in examples:
-        # Relationship STIX ID
-        rel_id = getattr(rel, "id", None)
-
-        # Description of the specific usage of this technique
-        desc = getattr(rel, "description", None) if include_description else None
-
-        # Source entity (intrusion-set, malware, tool, or campaign)
+    for rel in page_examples:
+        rel_id = _stix_get(rel, "id")
+        desc = _stix_get(rel, "description") if include_description else None
         source_stix_id = _stix_get(rel, "source_ref")
 
         src_attack_id = None
@@ -8148,27 +9054,35 @@ async def get_procedure_examples_by_technique(
             }
         )
 
-    # Human-readable lines using resolved entity names instead of raw STIX UUIDs
-    fmt_lines = []
-    for e in example_entries:
-        s = e["source"]
-        label = f"[{s.get('type') or 'unknown'}] {s.get('name') or s.get('stix_id')}"
-        if s.get("attack_id"):
-            label += f" ({s['attack_id']})"
-        if include_description and e.get("description"):
-            fmt_lines.append(f"- {label}: {e['description']}")
-        else:
-            fmt_lines.append(f"- {label}")
-    formatted = "\n".join(fmt_lines)
+    formatted = ""
+    if include_formatted:
+        fmt_lines = []
+        for e in example_entries:
+            s = e["source"]
+            label = f"[{s.get('type') or 'unknown'}] {s.get('name') or s.get('stix_id')}"
+            if s.get("attack_id"):
+                label += f" ({s['attack_id']})"
+            if include_description and e.get("description"):
+                fmt_lines.append(f"- {label}: {e['description']}")
+            else:
+                fmt_lines.append(f"- {label}")
+        formatted = "\n".join(fmt_lines)
 
     return {
+        "found": True,
         "technique": technique_info,
         "count": len(example_entries),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "examples": example_entries,
         "formatted": formatted,
         "message": (
-            f"Found {len(example_entries)} procedure examples for "
-            f"technique '{tech_attack_id}' ({tech_name})."
+            f"Found {total_count} procedure examples for "
+            f"technique '{tech_attack_id}' ({tech_name}) "
+            f"(returning {len(example_entries)} at offset {safe_offset})."
         ),
     }
 
@@ -8195,6 +9109,7 @@ async def get_procedure_examples_by_tactic(
             description="Zero-based starting index for pagination (>= 0).",
         ),
     ] = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all procedure examples for techniques in a specific tactic.
@@ -8405,21 +9320,23 @@ async def get_procedure_examples_by_tactic(
         )
 
     # --- Human-readable formatted block (for LLMs / humans) ---
-    fmt_lines = []
-    for e in example_entries:
-        s = e["source"]
-        t = e["technique"]
-        src_label = f"[{s.get('type') or 'unknown'}] {s.get('name') or s.get('stix_id')}"
-        if s.get("attack_id"):
-            src_label += f" ({s['attack_id']})"
-        tech_label = t.get("name") or t.get("stix_id") or "unknown"
-        if t.get("attack_id"):
-            tech_label += f" ({t['attack_id']})"
-        line = f"- {src_label} -> {tech_label}"
-        if include_description and e.get("description"):
-            line += f": {e['description']}"
-        fmt_lines.append(line)
-    formatted = "\n".join(fmt_lines)
+    formatted = ""
+    if include_formatted:
+        fmt_lines = []
+        for e in example_entries:
+            s = e["source"]
+            t = e["technique"]
+            src_label = f"[{s.get('type') or 'unknown'}] {s.get('name') or s.get('stix_id')}"
+            if s.get("attack_id"):
+                src_label += f" ({s['attack_id']})"
+            tech_label = t.get("name") or t.get("stix_id") or "unknown"
+            if t.get("attack_id"):
+                tech_label += f" ({t['attack_id']})"
+            line = f"- {src_label} -> {tech_label}"
+            if include_description and e.get("description"):
+                line += f": {e['description']}"
+            fmt_lines.append(line)
+        formatted = "\n".join(fmt_lines)
     has_more = (safe_offset + len(example_entries)) < total_count
 
     return {
@@ -8466,6 +9383,7 @@ async def get_objects_by_type(
             description="Zero-based starting index for pagination (>= 0).",
         ),
     ] = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all objects of a specific STIX type.
@@ -8571,10 +9489,14 @@ async def get_objects_by_type(
             }
         )
 
-    formatted = format_objects(
-        page_objs,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_objs,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
     has_more = (safe_offset + len(entries)) < total_count
 
@@ -8601,14 +9523,19 @@ async def get_tactics_by_matrix(
     matrix_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = False,
+    include_formatted: bool = True,
 ):
     """
     Get all ATT&CK tactics belonging to a specific matrix.
 
+    Accepts either a STIX ID ("x-mitre-matrix--UUID") or an ATT&CK matrix ID/name
+    (e.g., "enterprise-attack", "mobile-attack", "ics-attack", "Enterprise ATT&CK").
+
     Args:
-        matrix_stix_id: STIX ID of the matrix (e.g., x-mitre-matrix--UUID)
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics')
-        include_description: Whether to include tactic descriptions
+        matrix_stix_id: STIX ID ("x-mitre-matrix--UUID") or ATT&CK matrix ID (e.g., "enterprise-attack").
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        include_description: Whether to include tactic descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
@@ -8628,12 +9555,19 @@ async def get_tactics_by_matrix(
     """
     attack_data = get_attack_data(domain)
 
-    matrix_name = None
-    try:
-        matrix_obj = attack_data.get_object_by_stix_id(matrix_stix_id)
-        matrix_name = _stix_get(matrix_obj, "name") if matrix_obj is not None else None
-    except Exception:
-        matrix_name = None
+    resolved_id, matrix_obj, err = _resolve_stix_object(
+        matrix_stix_id, domain=domain, expected_stix_type="x-mitre-matrix"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "count": 0,
+            "tactics": [],
+            "formatted": "",
+            "message": err or f"Matrix '{matrix_stix_id}' not found in domain '{domain}'.",
+        }
+    matrix_stix_id = resolved_id
+    matrix_name = _stix_get(matrix_obj, "name") if matrix_obj is not None else None
 
     try:
         tactics_map = attack_data.get_tactics_by_matrix() or {}
@@ -8682,10 +9616,14 @@ async def get_tactics_by_matrix(
             }
         )
 
-    formatted = format_objects(
-        tactics,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            tactics,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
@@ -8701,16 +9639,19 @@ async def get_tactics_by_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = False,
+    include_formatted: bool = True,
 ):
     """
     Get all tactics associated with a specific ATT&CK technique.
 
     Techniques can belong to one or more tactics (kill chain phases).
+    Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1190").
 
     Args:
-        technique_stix_id: Technique STIX UUID identifier (attack-pattern--UUID)
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics')
-        include_description: Whether to include tactic descriptions
+        technique_stix_id: Technique STIX UUID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        include_description: Whether to include tactic descriptions.
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
 
     Returns:
         {
@@ -8729,6 +9670,19 @@ async def get_tactics_by_technique(
         }
     """
     attack_data = get_attack_data(domain)
+
+    resolved_id, _tech_obj, err = _resolve_stix_object(
+        technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "count": 0,
+            "tactics": [],
+            "formatted": "",
+            "message": err or f"Technique '{technique_stix_id}' not found in domain '{domain}'.",
+        }
+    technique_stix_id = resolved_id
 
     try:
         tactics = attack_data.get_tactics_by_technique(technique_stix_id) or []
@@ -8749,28 +9703,32 @@ async def get_tactics_by_technique(
 
     results = []
     for tac in tactics:
-        stix_id = tac.id
+        stix_id = _stix_get(tac, "id")
 
         try:
-            attack_id = attack_data.get_attack_id(stix_id)
+            attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
         except Exception:
             attack_id = None
 
         results.append(
             {
-                "name": getattr(tac, "name", None),
+                "name": _stix_get(tac, "name"),
                 "stix_id": stix_id,
                 "attack_id": attack_id,
-                "description": getattr(tac, "description", None)
+                "description": _stix_get(tac, "description")
                 if include_description
                 else None,
             }
         )
 
-    formatted = format_objects(
-        tactics,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            tactics,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
@@ -8788,23 +9746,10 @@ async def get_objects_created_after(
     domain: str = "enterprise",
     include_description: bool = True,
     remove_revoked_deprecated: bool = True,
-    limit: Annotated[
-        int,
-        Field(
-            default=DEFAULT_PAGE_LIMIT,
-            ge=1,
-            le=MAX_PAGE_LIMIT,
-            description=f"Maximum number of items to return per page (1-{MAX_PAGE_LIMIT}).",
-        ),
-    ] = DEFAULT_PAGE_LIMIT,
-    offset: Annotated[
-        int,
-        Field(
-            default=0,
-            ge=0,
-            description="Zero-based starting index for pagination (>= 0).",
-        ),
-    ] = 0,
+    stix_type: Optional[str] = None,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK objects created after a specific timestamp.
@@ -8812,28 +9757,35 @@ async def get_objects_created_after(
     Useful for detecting new additions to the framework.
     Timestamp must be ISO8601 format, e.g., '2024-01-01T00:00:00Z'.
 
+    Args:
+        timestamp: ISO8601 timestamp string (e.g., '2025-01-01T00:00:00Z').
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        include_description: Whether to include object descriptions.
+        remove_revoked_deprecated: Whether to exclude revoked/deprecated objects.
+        stix_type: Optional STIX type filter (e.g., 'attack-pattern', 'intrusion-set',
+                   'malware', 'campaign', 'x-mitre-detection-strategy').
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
+
     Returns:
         {
             "found": bool,
             "count": int,
-            "objects": [
-                {
-                    "id": "<ATT&CK ID or None>",
-                    "name": "...",
-                    "stix_id": "...",
-                    "type": "<stix-type>",
-                    "description": "..." | None
-                },
-                ...
-            ],
+            "total_count": int,
+            "offset": int,
+            "limit": int,
+            "has_more": bool,
+            "next_offset": int | None,
+            "objects": [...],
             "formatted": "<pretty text>",
             "message": "..."
         }
     """
     attack_data = get_attack_data(domain)
     safe_limit, safe_offset = _validate_pagination(limit, offset)
+    norm_stix_type = (stix_type or "").strip().lower() or None
 
-    # Try to fetch objects
     try:
         objects = attack_data.get_objects_created_after(
             timestamp, remove_revoked_deprecated=remove_revoked_deprecated
@@ -8852,7 +9804,15 @@ async def get_objects_created_after(
             "message": f"Error retrieving objects created after {timestamp}: {e}",
         }
 
+    if norm_stix_type:
+        objects = [
+            item
+            for item in objects
+            if (_stix_get(_unwrap_stix_object(item), "type") or "").lower() == norm_stix_type
+        ]
+
     if not objects:
+        type_clause = f" of type '{norm_stix_type}'" if norm_stix_type else ""
         return {
             "found": False,
             "count": 0,
@@ -8863,7 +9823,7 @@ async def get_objects_created_after(
             "next_offset": None,
             "objects": [],
             "formatted": "",
-            "message": f"No objects created after '{timestamp}' in domain '{domain}'.",
+            "message": f"No objects{type_clause} created after '{timestamp}' in domain '{domain}'.",
         }
 
     objects.sort(
@@ -8876,7 +9836,6 @@ async def get_objects_created_after(
         objects, limit=limit, offset=offset
     )
 
-    # Build structured response
     results = []
     for item in page_objects:
         obj = _unwrap_stix_object(item)
@@ -8900,9 +9859,13 @@ async def get_objects_created_after(
             }
         )
 
-    # Pretty printed human-friendly block
-    formatted = format_objects(page_objects, include_description=include_description, domain=domain)
+    formatted = (
+        format_objects(page_objects, include_description=include_description, domain=domain)
+        if include_formatted
+        else ""
+    )
     has_more = (safe_offset + len(results)) < total_count
+    type_clause = f" of type '{norm_stix_type}'" if norm_stix_type else ""
 
     return {
         "found": True,
@@ -8914,7 +9877,7 @@ async def get_objects_created_after(
         "next_offset": safe_offset + len(results) if has_more else None,
         "objects": results,
         "formatted": formatted,
-        "message": f"Showing {len(results)} of {total_count} objects created after {timestamp} (offset={safe_offset}).",
+        "message": f"Showing {len(results)} of {total_count} objects{type_clause} created after {timestamp} (offset={safe_offset}).",
     }
 
 @mcp.tool()
@@ -8923,23 +9886,10 @@ async def get_objects_modified_after(
     domain: str = "enterprise",
     include_description: bool = True,
     remove_revoked_deprecated: bool = True,
-    limit: Annotated[
-        int,
-        Field(
-            default=DEFAULT_PAGE_LIMIT,
-            ge=1,
-            le=MAX_PAGE_LIMIT,
-            description=f"Maximum number of items to return per page (1-{MAX_PAGE_LIMIT}).",
-        ),
-    ] = DEFAULT_PAGE_LIMIT,
-    offset: Annotated[
-        int,
-        Field(
-            default=0,
-            ge=0,
-            description="Zero-based starting index for pagination (>= 0).",
-        ),
-    ] = 0,
+    stix_type: Optional[str] = None,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK objects modified after a specific timestamp.
@@ -8947,28 +9897,35 @@ async def get_objects_modified_after(
     Useful for tracking updates and changes to the ATT&CK framework.
     Timestamp must be ISO8601 format, e.g., '2024-01-01T00:00:00Z'.
 
+    Args:
+        timestamp: ISO8601 timestamp string (e.g., '2025-01-01T00:00:00Z').
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        include_description: Whether to include object descriptions.
+        remove_revoked_deprecated: Whether to exclude revoked/deprecated objects.
+        stix_type: Optional STIX type filter (e.g., 'attack-pattern', 'intrusion-set',
+                   'malware', 'campaign', 'x-mitre-detection-strategy').
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
+
     Returns:
         {
             "found": bool,
             "count": int,
-            "objects": [
-                {
-                    "id": "<ATT&CK ID or None>",
-                    "name": "...",
-                    "stix_id": "...",
-                    "type": "<stix-type>",
-                    "description": "..." | None
-                },
-                ...
-            ],
+            "total_count": int,
+            "offset": int,
+            "limit": int,
+            "has_more": bool,
+            "next_offset": int | None,
+            "objects": [...],
             "formatted": "<pretty text>",
             "message": "..."
         }
     """
     attack_data = get_attack_data(domain)
     safe_limit, safe_offset = _validate_pagination(limit, offset)
+    norm_stix_type = (stix_type or "").strip().lower() or None
 
-    # Try to fetch objects
     try:
         objects = attack_data.get_objects_modified_after(
             timestamp, remove_revoked_deprecated=remove_revoked_deprecated
@@ -8987,7 +9944,15 @@ async def get_objects_modified_after(
             "message": f"Error retrieving objects modified after {timestamp}: {e}",
         }
 
+    if norm_stix_type:
+        objects = [
+            item
+            for item in objects
+            if (_stix_get(_unwrap_stix_object(item), "type") or "").lower() == norm_stix_type
+        ]
+
     if not objects:
+        type_clause = f" of type '{norm_stix_type}'" if norm_stix_type else ""
         return {
             "found": False,
             "count": 0,
@@ -8998,7 +9963,7 @@ async def get_objects_modified_after(
             "next_offset": None,
             "objects": [],
             "formatted": "",
-            "message": f"No objects modified after '{timestamp}' in domain '{domain}'.",
+            "message": f"No objects{type_clause} modified after '{timestamp}' in domain '{domain}'.",
         }
 
     objects.sort(
@@ -9011,7 +9976,6 @@ async def get_objects_modified_after(
         objects, limit=limit, offset=offset
     )
 
-    # Build structured response
     results: list[Dict[str, Any]] = []
     for item in page_objects:
         obj = _unwrap_stix_object(item)
@@ -9033,13 +9997,17 @@ async def get_objects_modified_after(
             }
         )
 
-    # Human-readable formatted output
-    formatted = format_objects(
-        page_objects,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_objects,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
     has_more = (safe_offset + len(results)) < total_count
+    type_clause = f" of type '{norm_stix_type}'" if norm_stix_type else ""
 
     return {
         "found": True,
@@ -9051,13 +10019,16 @@ async def get_objects_modified_after(
         "next_offset": safe_offset + len(results) if has_more else None,
         "objects": results,
         "formatted": formatted,
-        "message": f"Showing {len(results)} of {total_count} objects modified after {timestamp} (offset={safe_offset}).",
+        "message": f"Showing {len(results)} of {total_count} objects{type_clause} modified after {timestamp} (offset={safe_offset}).",
     }
 
 @mcp.tool()
 async def get_revoked_techniques(
     domain: str = "enterprise",
     include_description: bool = True,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+    offset: PageOffset = 0,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all revoked techniques for a domain.
@@ -9065,44 +10036,75 @@ async def get_revoked_techniques(
     Revoked techniques are no longer valid in the framework, often because
     they were merged or replaced.
 
+    Args:
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        include_description: Whether to include technique descriptions.
+        limit: Maximum number of items to return per page (1-200).
+        offset: Zero-based starting index for pagination (>= 0).
+        include_formatted: If False, omits the human-readable formatted block to save tokens.
+
     Returns:
         {
             "found": bool,
             "count": int,
+            "total_count": int,
+            "offset": int,
+            "limit": int,
+            "has_more": bool,
+            "next_offset": int | None,
             "techniques": [...],
             "formatted": "<pretty output>",
             "message": "..."
         }
     """
     attack_data = get_attack_data(domain)
+    safe_limit, safe_offset = _validate_pagination(limit, offset)
 
-    # Retrieve ALL techniques, including revoked ones
     try:
         all_techniques = attack_data.get_techniques(remove_revoked_deprecated=False)
     except Exception as e:
         return {
             "found": False,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": f"Error retrieving techniques: {e}",
         }
 
-    # Filter revoked only
     revoked = [t for t in all_techniques if _stix_get(t, "revoked", False)]
 
     if not revoked:
         return {
             "found": False,
             "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
             "techniques": [],
             "formatted": "",
             "message": f"No revoked techniques found in domain '{domain}'.",
         }
 
-    # Build structured output
+    revoked_sorted = sorted(
+        revoked,
+        key=lambda t: (
+            str(_stix_get(t, "name") or ""),
+            str(_stix_get(t, "id") or ""),
+        ),
+    )
+    page_revoked, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        revoked_sorted, limit=limit, offset=offset
+    )
+
     output_items = []
-    for tech in revoked:
+    for tech in page_revoked:
         stix_id = _stix_get(tech, "id")
         try:
             attack_id = attack_data.get_attack_id(stix_id) if stix_id else None
@@ -9121,19 +10123,27 @@ async def get_revoked_techniques(
             }
         )
 
-    # Human-readable formatted block
-    formatted = format_objects(
-        revoked,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            page_revoked,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
         "found": True,
         "count": len(output_items),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
         "techniques": output_items,
         "formatted": formatted,
-        "message": f"Found {len(output_items)} revoked techniques in '{domain}'.",
+        "message": f"Found {total_count} revoked techniques in '{domain}' (returning {len(output_items)} at offset {safe_offset}).",
     }
 
 @mcp.tool()
@@ -9152,19 +10162,19 @@ async def generate_layer(
       - Gxxxx : groups (intrusion sets)
       - Mxxxx : mitigations (course-of-action)
       - Sxxxx : software (tool/malware)
-      - Dxxxx : data components
+      - DCxxxx : data components (ATT&CK v20.1; legacy Dxxxx also accepted)
 
     Technique IDs (Txxxx / Txxxx.xxx) are NOT supported here.
 
     Args:
-        attack_id: ATT&CK ID (Gxxxx, Mxxxx, Sxxxx, or Dxxxx)
+        attack_id: ATT&CK ID (Gxxxx, Mxxxx, Sxxxx, or DCxxxx)
         score: Score to assign to all matched techniques in the layer
         domain: ATT&CK domain (e.g., "enterprise", "mobile", "ics")
 
     Returns:
         {
           "success": bool,
-          "attack_id": "<G/M/S/D ID>",
+          "attack_id": "<G/M/S/DC ID>",
           "domain": "<domain>",
           "count": int,              # number of techniques in layer
           "layer": { ... } | null,   # ATT&CK Navigator layer JSON
@@ -9442,8 +10452,28 @@ async def get_detection_strategies_for_technique(
     """
     Get ATT&CK v20.1 detection strategies (DETxxxx), analytics (ANxxxx), and
     referenced data components (DCxxxx) that detect a given technique.
+
+    Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1190").
+
+    Args:
+        technique_stix_id: Technique STIX ID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        include_description: Whether to include strategy and analytic descriptions.
     """
     ad = get_attack_data(domain)
+    resolved_id, _tech_obj, err = _resolve_stix_object(
+        technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
+    )
+    if resolved_id is None:
+        return {
+            "found": False,
+            "technique_stix_id": technique_stix_id,
+            "domain": domain,
+            "count": 0,
+            "detection_strategies": [],
+            "message": err or f"Technique '{technique_stix_id}' not found in domain '{domain}'.",
+        }
+    technique_stix_id = resolved_id
     v20_idx = _get_v20_detection_index(domain)
     ds_ids = v20_idx["tech_to_ds"].get(technique_stix_id, [])
 
@@ -9496,6 +10526,7 @@ async def get_detection_strategies_for_technique(
         })
 
     return {
+        "found": True,
         "technique_stix_id": technique_stix_id,
         "domain": domain,
         "count": len(strategies),
