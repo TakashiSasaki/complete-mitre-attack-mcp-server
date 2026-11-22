@@ -7585,6 +7585,7 @@ async def get_all_assets(
     domain: str = "ics",
     remove_revoked_deprecated: bool = True,
     include_description: bool = True,
+    include_formatted: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK assets in a domain (primarily ICS).
@@ -7596,6 +7597,7 @@ async def get_all_assets(
         domain: ATT&CK domain ("ics" recommended)
         remove_revoked_deprecated: Exclude revoked/deprecated entries
         include_description: Include asset descriptions
+        include_formatted: Include human-readable formatted text block (set False to save tokens)
 
     Returns:
         {
@@ -7609,7 +7611,7 @@ async def get_all_assets(
               "attack_id": "<Axxxx or None>"
             }
           ],
-          "formatted": "<human-readable output>",
+          "formatted": "<human-readable output or empty string when include_formatted=False>",
           "message": "<summary>"
         }
     """
@@ -7673,10 +7675,14 @@ async def get_all_assets(
         )
 
     # Human-readable formatting (not required for apps, useful for ChatGPT)
-    formatted = format_objects(
-        assets_for_format,
-        include_description=include_description,
-        domain=domain,
+    formatted = (
+        format_objects(
+            assets_for_format,
+            include_description=include_description,
+            domain=domain,
+        )
+        if include_formatted
+        else ""
     )
 
     return {
@@ -8788,9 +8794,15 @@ async def get_techniques_by_platform(
     """
     Get all ATT&CK techniques that apply to a specific platform.
 
+    Supports case-insensitive platform matching (e.g., 'linux' -> 'Linux') and
+    common legacy aliases ('Azure AD' -> 'Identity Provider', 'Network' -> 'Network Devices').
+    When no techniques match, returns `available_platforms` listing valid platform names
+    for the requested domain so callers can self-correct in one step.
+
     Args:
-        platform: Platform name (e.g., 'Windows', 'Linux', 'macOS', 
-                  'Cloud', 'Azure AD', 'Network', etc.)
+        platform: Platform name (e.g., 'Windows', 'Linux', 'macOS', 'Containers',
+                  'IaaS', 'SaaS', 'Network Devices', 'ESXi', 'Identity Provider',
+                  'Office Suite', 'PRE'). Matching is case-insensitive.
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Whether to include technique descriptions.
 
@@ -8819,8 +8831,25 @@ async def get_techniques_by_platform(
         "network": "Network Devices",
     }
     raw_plat = (platform or "").strip()
+
+    all_techs: List[Any] = []
+    known_platforms: Dict[str, str] = {}
+    try:
+        all_techs = attack_data.get_techniques(
+            remove_revoked_deprecated=remove_revoked_deprecated
+        ) or []
+        for t in all_techs:
+            for p in (_stix_get(t, "x_mitre_platforms", []) or []):
+                if p and str(p).strip():
+                    ps = str(p).strip()
+                    known_platforms[ps.lower()] = ps
+    except Exception:
+        all_techs = []
+    available_platforms = sorted(set(known_platforms.values()))
+
     if not raw_plat:
         safe_limit, safe_offset = _validate_pagination(limit, offset)
+        avail_str = ", ".join(available_platforms) if available_platforms else "none"
         return {
             "platform": "",
             "count": 0,
@@ -8830,41 +8859,31 @@ async def get_techniques_by_platform(
             "has_more": False,
             "next_offset": None,
             "techniques": [],
+            "available_platforms": available_platforms,
             "formatted": "",
             "message": (
                 f"No techniques found for platform '' "
-                f"in domain '{domain}'."
+                f"in domain '{domain}'. "
+                f"Valid platforms for domain '{domain}': {avail_str}."
             ),
         }
 
     plat_norm = platform_aliases.get(raw_plat.lower(), raw_plat)
 
     # Resolve canonical platform casing and filter exact case-insensitively
-    canonical_platform = plat_norm
-    techniques: List[Any] = []
-    try:
-        all_techs = attack_data.get_techniques(
-            remove_revoked_deprecated=remove_revoked_deprecated
-        ) or []
-        known_platforms: Dict[str, str] = {}
-        for t in all_techs:
-            for p in (_stix_get(t, "x_mitre_platforms", []) or []):
-                known_platforms[p.lower()] = p
-        if plat_norm.lower() in known_platforms:
-            canonical_platform = known_platforms[plat_norm.lower()]
-        target_plat_lower = canonical_platform.lower()
-        techniques = [
-            t for t in all_techs
-            if any(
-                (p or "").strip().lower() == target_plat_lower
-                for p in (_stix_get(t, "x_mitre_platforms", []) or [])
-            )
-        ]
-    except Exception:
-        techniques = []
+    canonical_platform = known_platforms.get(plat_norm.lower(), plat_norm)
+    target_plat_lower = canonical_platform.lower()
+    techniques = [
+        t for t in all_techs
+        if any(
+            (p or "").strip().lower() == target_plat_lower
+            for p in (_stix_get(t, "x_mitre_platforms", []) or [])
+        )
+    ]
 
     if not techniques:
         safe_limit, safe_offset = _validate_pagination(limit, offset)
+        avail_str = ", ".join(available_platforms) if available_platforms else "none"
         return {
             "platform": canonical_platform,
             "count": 0,
@@ -8874,10 +8893,12 @@ async def get_techniques_by_platform(
             "has_more": False,
             "next_offset": None,
             "techniques": [],
+            "available_platforms": available_platforms,
             "formatted": "",
             "message": (
                 f"No techniques found for platform '{canonical_platform}' "
-                f"in domain '{domain}'."
+                f"in domain '{domain}'. "
+                f"Valid platforms for domain '{domain}': {avail_str}."
             ),
         }
 
@@ -12220,12 +12241,46 @@ async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
 
 
 
+def _normalize_detection_platforms(
+    platforms: Optional[List[str]],
+    an_by_id: Optional[Dict[str, Any]] = None,
+) -> Optional[List[str]]:
+    """Normalize an optional list of platform filter names for detection strategies.
+
+    Returns None when no non-empty platform filter is requested (preserving
+    unfiltered backward-compatible behavior). When provided, resolves canonical
+    platform casing from known analytics in the domain when available and
+    returns a deduplicated, deterministically sorted list.
+    """
+    if platforms is None:
+        return None
+    raw_items = [str(p).strip() for p in platforms if p is not None and str(p).strip()]
+    if not raw_items:
+        return None
+
+    known_lower: Dict[str, str] = {}
+    if an_by_id:
+        for an_obj in an_by_id.values():
+            for p in (_stix_get(an_obj, "x_mitre_platforms") or []):
+                if p and str(p).strip():
+                    ps = str(p).strip()
+                    known_lower[ps.lower()] = ps
+
+    dedup: Dict[str, str] = {}
+    for item in raw_items:
+        key = item.lower()
+        if key not in dedup:
+            dedup[key] = known_lower.get(key, item)
+    return sorted(dedup.values())
+
+
 def _build_detection_batch_metadata(
     domain: str,
     include_description: bool,
     exists: Optional[bool] = None,
     detail_level: str = "compact",
     include_log_sources: bool = False,
+    applied_platforms: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build version, source provenance, and coverage caveat metadata for batch detection responses."""
     if domain in DOMAINS:
@@ -12249,6 +12304,8 @@ def _build_detection_batch_metadata(
         "max_batch_size": MAX_BATCH_DETECTION_TECHNIQUES,
         "caveat": _DETECTION_COVERAGE_CAVEAT,
     }
+    if applied_platforms is not None:
+        meta["applied_platforms"] = applied_platforms
     if detail_level == "full":
         meta["stix_spec_version"] = prov.get("stix_spec_version", "2.1")
         meta["source_repository"] = prov.get("source_repository", _SOURCE_REPOSITORY_URL)
@@ -12291,11 +12348,13 @@ def _get_detection_strategies_batch(
     include_description: bool,
     detail_level: str = "compact",
     include_log_sources: bool = False,
+    platforms: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Deterministic, deduplicated batch detection-strategy lookup for multiple techniques."""
     dom = (domain or "enterprise").strip().lower()
     level = (detail_level or "compact").strip().lower() if isinstance(detail_level, str) else str(detail_level).lower()
     eff_log_sources = bool(include_log_sources) or (level == "full")
+    raw_applied_platforms = _normalize_detection_platforms(platforms)
 
     raw_tokens: List[str] = []
     if isinstance(technique_stix_id, str) and technique_stix_id.strip():
@@ -12362,6 +12421,7 @@ def _get_detection_strategies_batch(
                 exists=exists,
                 detail_level=eff_level,
                 include_log_sources=eff_log_sources,
+                applied_platforms=raw_applied_platforms,
             ),
             "message": message,
         }
@@ -12466,6 +12526,11 @@ def _get_detection_strategies_batch(
     tech_to_ds = v20_idx["tech_to_ds"]
     an_to_dcs = v20_idx["an_to_dcs"]
     an_log_source_refs = v20_idx.get("an_log_source_refs", {})
+
+    applied_platforms = _normalize_detection_platforms(platforms, an_by_id)
+    platform_filter_lower = (
+        {p.lower() for p in applied_platforms} if applied_platforms is not None else None
+    )
 
     def _lookup_aid(cache_map: Dict[str, Optional[str]], stix_id: str) -> str:
         aid = cache_map.get(stix_id)
@@ -12576,6 +12641,28 @@ def _get_detection_strategies_batch(
             ds_obj = ds_by_id.get(ds_stix_id)
             if ds_obj is None:
                 continue
+
+            matching_analytics: List[Tuple[str, Any, List[str]]] = []
+            for an_stix_id in (_stix_get(ds_obj, "x_mitre_analytic_refs") or []):
+                an_obj = an_by_id.get(an_stix_id)
+                if an_obj is None:
+                    continue
+                an_platforms = sorted(
+                    {
+                        str(p).strip()
+                        for p in (_stix_get(an_obj, "x_mitre_platforms") or [])
+                        if p and str(p).strip()
+                    }
+                )
+                if platform_filter_lower is not None and not any(
+                    p.lower() in platform_filter_lower for p in an_platforms
+                ):
+                    continue
+                matching_analytics.append((an_stix_id, an_obj, an_platforms))
+
+            if platform_filter_lower is not None and not matching_analytics:
+                continue
+
             ds_aid = _lookup_aid(ds_aid_map, ds_stix_id)
             t_ds_ids.add(ds_aid)
             edges_t_ds.add((tech_key, ds_aid))
@@ -12594,22 +12681,11 @@ def _get_detection_strategies_batch(
                 ds_cov[ds_stix_id] = ds_entry
             ds_entry["_technique_ids"].add(tech_key)
 
-            for an_stix_id in (_stix_get(ds_obj, "x_mitre_analytic_refs") or []):
-                an_obj = an_by_id.get(an_stix_id)
-                if an_obj is None:
-                    continue
+            for an_stix_id, an_obj, an_platforms in matching_analytics:
                 an_aid = _lookup_aid(an_aid_map, an_stix_id)
                 t_an_ids.add(an_aid)
                 ds_entry["_analytic_ids"].add(an_aid)
                 edges_ds_an.add((ds_aid, an_aid))
-
-                an_platforms = sorted(
-                    {
-                        str(p).strip()
-                        for p in (_stix_get(an_obj, "x_mitre_platforms") or [])
-                        if p and str(p).strip()
-                    }
-                )
                 t_platforms.update(an_platforms)
 
                 an_entry = an_cov.get(an_stix_id)
@@ -12870,7 +12946,12 @@ def _get_detection_strategies_batch(
             ),
         }
 
-        return {
+        plat_suffix = (
+            f" (filtered by platforms: {', '.join(applied_platforms)})"
+            if applied_platforms is not None
+            else ""
+        )
+        compact_resp: Dict[str, Any] = {
             "found": any_resolved,
             "batch": True,
             "detail_level": "compact",
@@ -12904,15 +12985,24 @@ def _get_detection_strategies_batch(
                 exists=True,
                 detail_level="compact",
                 include_log_sources=eff_log_sources,
+                applied_platforms=applied_platforms,
             ),
             "message": (
                 f"Resolved {found_count + no_det_count} of {len(techniques_out)} technique(s) "
                 f"in domain '{dom}': {len(ds_out)} unique detection strategy(ies), "
-                f"{len(an_out)} analytic(s), {len(dc_out)} data component(s)."
+                f"{len(an_out)} analytic(s), {len(dc_out)} data component(s){plat_suffix}."
             ),
         }
+        if applied_platforms is not None:
+            compact_resp["applied_platforms"] = applied_platforms
+        return compact_resp
 
-    return {
+    plat_suffix = (
+        f" (filtered by platforms: {', '.join(applied_platforms)})"
+        if applied_platforms is not None
+        else ""
+    )
+    full_resp: Dict[str, Any] = {
         "found": any_resolved,
         "batch": True,
         "detail_level": "full",
@@ -12946,13 +13036,17 @@ def _get_detection_strategies_batch(
             exists=True,
             detail_level="full",
             include_log_sources=True,
+            applied_platforms=applied_platforms,
         ),
         "message": (
             f"Resolved {found_count + no_det_count} of {len(techniques_out)} technique(s) "
             f"in domain '{dom}': {len(ds_out)} unique detection strategy(ies), "
-            f"{len(an_out)} analytic(s), {len(dc_out)} data component(s)."
+            f"{len(an_out)} analytic(s), {len(dc_out)} data component(s){plat_suffix}."
         ),
     }
+    if applied_platforms is not None:
+        full_resp["applied_platforms"] = applied_platforms
+    return full_resp
 
 
 @mcp.tool()
@@ -12963,6 +13057,7 @@ async def get_detection_strategies_for_technique(
     technique_ids: Optional[List[str]] = None,
     detail_level: BatchDetailLevel = "compact",
     include_log_sources: bool = False,
+    platforms: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Get ATT&CK v20.1 detection strategies (DETxxxx), analytics (ANxxxx), and
@@ -12971,7 +13066,7 @@ async def get_detection_strategies_for_technique(
     Single-technique mode (default when a single ID is passed via `technique_stix_id`
     and `technique_ids` is omitted):
       - Accepts a STIX ID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
-      - Preserves the exact single-technique response schema.
+      - Preserves the exact single-technique response schema when `platforms` is omitted.
 
     Batch mode (triggered when `technique_ids` is provided OR `technique_stix_id`
     contains comma-separated IDs such as "T1190,T1059.001,T1003"):
@@ -12983,6 +13078,12 @@ async def get_detection_strategies_for_technique(
         ID lists, and log sources (or `include_log_sources=True` to add log sources in
         compact mode).
 
+    Platform filtering (supported in both single and batch modes):
+      - Pass `platforms=["Linux"]` or `platforms=["Windows", "ESXi"]` to filter
+        returned analytics and their referenced data components case-insensitively
+        against each analytic's `platforms`. When applied, `applied_platforms` is
+        included in the response (and in `metadata` for batch mode).
+
     Args:
         technique_stix_id: Single technique STIX/ATT&CK ID (e.g., "T1190") or
             comma-separated technique IDs (e.g., "T1190,T1059.001,T1003").
@@ -12991,6 +13092,8 @@ async def get_detection_strategies_for_technique(
         technique_ids: Optional list of technique STIX/ATT&CK IDs for batch lookup.
         detail_level: Batch detail level ('compact' default, or 'full'). Ignored in single mode.
         include_log_sources: Include log source names in compact batch mode (always included in 'full').
+        platforms: Optional list of platform names (e.g., ['Linux'], ['Windows', 'ESXi'])
+            for case-insensitive filtering of analytics and data components.
     """
     is_batch = technique_ids is not None or (
         isinstance(technique_stix_id, str) and "," in technique_stix_id
@@ -13003,6 +13106,7 @@ async def get_detection_strategies_for_technique(
             include_description=include_description,
             detail_level=detail_level,
             include_log_sources=include_log_sources,
+            platforms=platforms,
         )
 
     ad = get_attack_data(domain)
@@ -13010,7 +13114,8 @@ async def get_detection_strategies_for_technique(
         technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
     )
     if resolved_id is None:
-        return {
+        raw_applied = _normalize_detection_platforms(platforms)
+        not_found_resp: Dict[str, Any] = {
             "found": False,
             "technique_stix_id": technique_stix_id,
             "domain": domain,
@@ -13018,8 +13123,16 @@ async def get_detection_strategies_for_technique(
             "detection_strategies": [],
             "message": err or f"Technique '{technique_stix_id}' not found in domain '{domain}'.",
         }
+        if raw_applied is not None:
+            not_found_resp["applied_platforms"] = raw_applied
+        return not_found_resp
+
     technique_stix_id = resolved_id
     v20_idx = _get_v20_detection_index(domain)
+    applied_platforms = _normalize_detection_platforms(platforms, v20_idx.get("an_by_id"))
+    platform_filter_lower = (
+        {p.lower() for p in applied_platforms} if applied_platforms is not None else None
+    )
     ds_ids = v20_idx["tech_to_ds"].get(technique_stix_id, [])
 
     strategies = []
@@ -13036,6 +13149,13 @@ async def get_detection_strategies_for_technique(
         for an_id in (_stix_get(ds_obj, "x_mitre_analytic_refs") or []):
             an_obj = v20_idx["an_by_id"].get(an_id)
             if an_obj is None:
+                continue
+            an_platforms = _stix_get(an_obj, "x_mitre_platforms", []) or []
+            if platform_filter_lower is not None and not any(
+                str(p).strip().lower() in platform_filter_lower
+                for p in an_platforms
+                if p and str(p).strip()
+            ):
                 continue
             try:
                 an_aid = ad.get_attack_id(an_id)
@@ -13057,10 +13177,13 @@ async def get_detection_strategies_for_technique(
                 "attack_id": an_aid,
                 "name": _stix_get(an_obj, "name"),
                 "stix_id": an_id,
-                "platforms": _stix_get(an_obj, "x_mitre_platforms", []),
+                "platforms": an_platforms,
                 "description": _stix_get(an_obj, "description") if include_description else None,
                 "data_components": dc_refs,
             })
+
+        if platform_filter_lower is not None and not an_list:
+            continue
 
         strategies.append({
             "attack_id": ds_aid,
@@ -13070,14 +13193,25 @@ async def get_detection_strategies_for_technique(
             "analytics": an_list,
         })
 
-    return {
+    plat_suffix = (
+        f" (filtered by platforms: {', '.join(applied_platforms)})"
+        if applied_platforms is not None
+        else ""
+    )
+    single_resp: Dict[str, Any] = {
         "found": True,
         "technique_stix_id": technique_stix_id,
         "domain": domain,
         "count": len(strategies),
         "detection_strategies": strategies,
-        "message": f"Found {len(strategies)} detection strategy(ies) for '{technique_stix_id}' in domain '{domain}'.",
+        "message": (
+            f"Found {len(strategies)} detection strategy(ies) for "
+            f"'{technique_stix_id}' in domain '{domain}'{plat_suffix}."
+        ),
     }
+    if applied_platforms is not None:
+        single_resp["applied_platforms"] = applied_platforms
+    return single_resp
 
 
 @mcp.tool()
