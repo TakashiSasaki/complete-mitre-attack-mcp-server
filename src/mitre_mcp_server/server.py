@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, List, Literal, Tuple, Dict, Any, Optional
 import os
+import re
 import sys
 
 from mitreattack import download_stix, release_info
@@ -22,6 +23,19 @@ DOMAINS: List[str] = ["enterprise", "mobile", "ics"]
 
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 200
+MAX_BATCH_DETECTION_TECHNIQUES = 50
+
+_TECHNIQUE_ATTACK_ID_RE = re.compile(r"^T\d{4}(?:\.\d{3})?$", re.IGNORECASE)
+_TECHNIQUE_STIX_ID_RE = re.compile(
+    r"^attack-pattern--[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_DETECTION_COVERAGE_CAVEAT = (
+    "ATT&CK detection strategies, analytics, and data components provide reference "
+    "detection guidance and telemetry mappings, not a guarantee of detection coverage "
+    "or effectiveness in any specific environment. Technique associations in ATT&CK "
+    "do not constitute proof of specific CVE exploitation."
+)
 
 PageLimit = Annotated[
     int,
@@ -790,16 +804,65 @@ def _get_v20_detection_index(domain: str) -> Dict[str, Any]:
         relationships = ad.get_objects_by_type("relationship", remove_revoked_deprecated=True) or []
     except Exception:
         relationships = []
+    try:
+        all_techniques = ad.get_techniques(remove_revoked_deprecated=False) or []
+    except Exception:
+        all_techniques = []
+
+    tech_by_stix_id: Dict[str, Any] = {}
+    tech_by_attack_id: Dict[str, Any] = {}
+    tech_attack_id_by_id: Dict[str, Optional[str]] = {}
+    for tech in all_techniques:
+        t_obj = _unwrap_stix_object(tech)
+        t_id = _stix_get(t_obj, "id")
+        if not t_id:
+            continue
+        t_id_lower = str(t_id).lower()
+        tech_by_stix_id[t_id_lower] = t_obj
+        t_aid: Optional[str] = None
+        for ref in (_stix_get(t_obj, "external_references") or []):
+            src_name = ref.get("source_name") if isinstance(ref, dict) else getattr(ref, "source_name", None)
+            ext_id = ref.get("external_id") if isinstance(ref, dict) else getattr(ref, "external_id", None)
+            if ext_id and src_name in ("mitre-attack", "mitre-ics-attack", "mitre-mobile-attack"):
+                t_aid = str(ext_id).strip().upper()
+                break
+        if t_aid is None:
+            for ref in (_stix_get(t_obj, "external_references") or []):
+                ext_id = ref.get("external_id") if isinstance(ref, dict) else getattr(ref, "external_id", None)
+                if ext_id and _TECHNIQUE_ATTACK_ID_RE.match(str(ext_id).strip()):
+                    t_aid = str(ext_id).strip().upper()
+                    break
+        tech_attack_id_by_id[t_id] = t_aid
+        if t_aid:
+            # Prefer non-revoked/non-deprecated object if duplicate external_id exists
+            existing = tech_by_attack_id.get(t_aid)
+            if existing is None or (
+                (_stix_get(existing, "revoked", False) or _stix_get(existing, "x_mitre_deprecated", False))
+                and not (_stix_get(t_obj, "revoked", False) or _stix_get(t_obj, "x_mitre_deprecated", False))
+            ):
+                tech_by_attack_id[t_aid] = t_obj
 
     ds_by_id = {_stix_get(d, "id"): d for d in det_strategies if _stix_get(d, "id")}
     an_by_id = {_stix_get(a, "id"): a for a in analytics if _stix_get(a, "id")}
     dc_by_id = {_stix_get(c, "id"): c for c in datacomponents if _stix_get(c, "id")}
+    ds_attack_id_by_id: Dict[str, Optional[str]] = {}
+    for ds_id in ds_by_id:
+        try:
+            ds_attack_id_by_id[ds_id] = ad.get_attack_id(ds_id)
+        except Exception:
+            ds_attack_id_by_id[ds_id] = None
     an_attack_id_by_id: Dict[str, Optional[str]] = {}
     for an_id in an_by_id:
         try:
             an_attack_id_by_id[an_id] = ad.get_attack_id(an_id)
         except Exception:
             an_attack_id_by_id[an_id] = None
+    dc_attack_id_by_id: Dict[str, Optional[str]] = {}
+    for dc_id in dc_by_id:
+        try:
+            dc_attack_id_by_id[dc_id] = ad.get_attack_id(dc_id)
+        except Exception:
+            dc_attack_id_by_id[dc_id] = None
 
     # Map detection strategy -> techniques and technique -> detection strategies
     tech_to_ds: Dict[str, List[str]] = {}
@@ -813,16 +876,39 @@ def _get_v20_detection_index(domain: str) -> Dict[str, Any]:
             tech_to_ds.setdefault(tgt, []).append(src)
             ds_to_tech.setdefault(src, []).append(tgt)
 
-    # Map analytic -> data components
+    # Map analytic -> data components and normalized log source references
     an_to_dcs: Dict[str, List[str]] = {}
+    an_log_source_refs: Dict[str, List[Dict[str, Optional[str]]]] = {}
     for an_id, an_obj in an_by_id.items():
         log_refs = _stix_get(an_obj, "x_mitre_log_source_references") or []
         dc_ids: List[str] = []
+        norm_refs: List[Dict[str, Optional[str]]] = []
         for lr in log_refs:
-            dc_ref = lr.get("x_mitre_data_component_ref") if isinstance(lr, dict) else getattr(lr, "x_mitre_data_component_ref", None)
+            dc_ref = (
+                lr.get("x_mitre_data_component_ref")
+                if isinstance(lr, dict)
+                else getattr(lr, "x_mitre_data_component_ref", None)
+            )
+            lr_name = (
+                lr.get("name")
+                if isinstance(lr, dict)
+                else getattr(lr, "name", None)
+            )
+            lr_channel = (
+                lr.get("channel")
+                if isinstance(lr, dict)
+                else getattr(lr, "channel", None)
+            )
             if dc_ref and dc_ref not in dc_ids:
                 dc_ids.append(dc_ref)
+            if dc_ref or lr_name or lr_channel:
+                norm_refs.append({
+                    "data_component_stix_id": dc_ref,
+                    "name": str(lr_name).strip() if lr_name else None,
+                    "channel": str(lr_channel).strip() if lr_channel else None,
+                })
         an_to_dcs[an_id] = dc_ids
+        an_log_source_refs[an_id] = norm_refs
 
     # Build technique -> data components and data component -> techniques
     tech_to_dcs: Dict[str, List[str]] = {}
@@ -841,13 +927,19 @@ def _get_v20_detection_index(domain: str) -> Dict[str, Any]:
         tech_to_dcs[tech_id] = seen_dc
 
     index = {
+        "tech_by_stix_id": tech_by_stix_id,
+        "tech_by_attack_id": tech_by_attack_id,
+        "tech_attack_id_by_id": tech_attack_id_by_id,
         "ds_by_id": ds_by_id,
+        "ds_attack_id_by_id": ds_attack_id_by_id,
         "an_by_id": an_by_id,
         "an_attack_id_by_id": an_attack_id_by_id,
         "dc_by_id": dc_by_id,
+        "dc_attack_id_by_id": dc_attack_id_by_id,
         "tech_to_ds": tech_to_ds,
         "ds_to_tech": ds_to_tech,
         "an_to_dcs": an_to_dcs,
+        "an_log_source_refs": an_log_source_refs,
         "tech_to_dcs": tech_to_dcs,
         "dc_to_techs": dc_to_techs,
     }
@@ -11022,23 +11114,626 @@ async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
 
 
 
+def _build_detection_batch_metadata(
+    domain: str,
+    include_description: bool,
+    exists: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Build version, source provenance, and coverage caveat metadata for batch detection responses."""
+    if domain in DOMAINS:
+        prov = _build_domain_provenance(domain, exists=exists)
+    else:
+        prov = {
+            "loaded_version": None,
+            "stix_spec_version": "2.1",
+            "source_url": None,
+            "source_repository": _SOURCE_REPOSITORY_URL,
+            "source_release_date": None,
+            "freshness_status": "invalid_domain",
+        }
+    return {
+        "attack_version": prov.get("loaded_version") or str(release_info.LATEST_VERSION),
+        "domain": domain,
+        "stix_spec_version": prov.get("stix_spec_version", "2.1"),
+        "source_url": prov.get("source_url"),
+        "source_repository": prov.get("source_repository", _SOURCE_REPOSITORY_URL),
+        "source_release_date": prov.get("source_release_date"),
+        "freshness_status": prov.get("freshness_status"),
+        "include_description": bool(include_description),
+        "max_batch_size": MAX_BATCH_DETECTION_TECHNIQUES,
+        "caveat": _DETECTION_COVERAGE_CAVEAT,
+    }
+
+
+def _empty_batch_coverage() -> Dict[str, Any]:
+    return {
+        "detection_strategies": [],
+        "analytics": [],
+        "data_components": [],
+        "edges": {
+            "technique_to_detection_strategy": [],
+            "detection_strategy_to_analytic": [],
+            "analytic_to_data_component": [],
+        },
+    }
+
+
+def _get_detection_strategies_batch(
+    technique_stix_id: str,
+    technique_ids: Optional[List[str]],
+    domain: str,
+    include_description: bool,
+) -> Dict[str, Any]:
+    """Deterministic, deduplicated batch detection-strategy lookup for multiple techniques."""
+    dom = (domain or "enterprise").strip().lower()
+
+    raw_tokens: List[str] = []
+    if isinstance(technique_stix_id, str) and technique_stix_id.strip():
+        raw_tokens.extend(part.strip() for part in technique_stix_id.split(","))
+    if technique_ids is not None:
+        for item in technique_ids:
+            if isinstance(item, str):
+                raw_tokens.extend(part.strip() for part in item.split(","))
+            elif item is not None:
+                raw_tokens.append(str(item).strip())
+
+    non_empty_tokens = [tok for tok in raw_tokens if tok]
+    requested_count = len(non_empty_tokens)
+
+    unique_tokens: List[str] = []
+    seen_tokens: set[str] = set()
+    dup_tokens: set[str] = set()
+    duplicates_removed_count = 0
+    for tok in non_empty_tokens:
+        canon = tok.lower() if "--" in tok else tok.upper()
+        if canon in seen_tokens:
+            dup_tokens.add(canon)
+            duplicates_removed_count += 1
+        else:
+            seen_tokens.add(canon)
+            unique_tokens.append(canon)
+
+    def _error_response(
+        error_code: str,
+        message: str,
+        techniques_list: Optional[List[Dict[str, Any]]] = None,
+        exists: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        tech_rows = techniques_list or []
+        unavail_count = sum(1 for t in tech_rows if t.get("status") == "UNAVAILABLE")
+        return {
+            "found": False,
+            "batch": True,
+            "domain": dom,
+            "error_code": error_code,
+            "count": 0,
+            "counts": {
+                "requested_inputs": requested_count,
+                "unique_inputs": len(unique_tokens),
+                "duplicates_removed": duplicates_removed_count,
+                "techniques_total": len(tech_rows),
+                "found": 0,
+                "valid_no_detection": 0,
+                "not_found": 0,
+                "invalid": 0,
+                "unavailable": unavail_count,
+                "detection_strategies": 0,
+                "analytics": 0,
+                "data_components": 0,
+            },
+            "duplicates_removed": sorted(dup_tokens),
+            "techniques": tech_rows,
+            "coverage": _empty_batch_coverage(),
+            "metadata": _build_detection_batch_metadata(
+                dom, include_description=include_description, exists=exists
+            ),
+            "message": message,
+        }
+
+    if dom not in DOMAINS:
+        return _error_response(
+            "INVALID_DOMAIN",
+            f"Invalid domain '{dom}'. Must be one of: {', '.join(DOMAINS)}.",
+        )
+
+    if not unique_tokens:
+        return _error_response(
+            "EMPTY_INPUT",
+            (
+                "No technique IDs provided. Supply one or more ATT&CK technique IDs "
+                "(e.g., 'T1190,T1059.001') or STIX IDs ('attack-pattern--<uuid>')."
+            ),
+        )
+
+    if len(unique_tokens) > MAX_BATCH_DETECTION_TECHNIQUES:
+        return _error_response(
+            "BATCH_LIMIT_EXCEEDED",
+            (
+                f"Batch size {len(unique_tokens)} exceeds maximum allowed "
+                f"{MAX_BATCH_DETECTION_TECHNIQUES} unique technique IDs per call."
+            ),
+        )
+
+    stix_path = get_stix_path(dom)
+    if not stix_path.exists():
+        unavailable_rows = [
+            {
+                "input": tok,
+                "matched_inputs": [tok],
+                "status": "UNAVAILABLE",
+                "attack_id": None,
+                "name": None,
+                "stix_id": None,
+                "revoked": False,
+                "deprecated": False,
+                "detection_strategy_ids": [],
+                "analytic_ids": [],
+                "data_component_ids": [],
+                "platforms": [],
+                "log_sources": [],
+                "error": f"STIX data for domain '{dom}' is not available.",
+            }
+            for tok in sorted(unique_tokens)
+        ]
+        return _error_response(
+            "DOMAIN_UNAVAILABLE",
+            f"STIX data for domain '{dom}' is not available.",
+            techniques_list=unavailable_rows,
+            exists=False,
+        )
+
+    try:
+        ad = get_attack_data(dom)
+        v20_idx = _get_v20_detection_index(dom)
+    except Exception as e:
+        unavailable_rows = [
+            {
+                "input": tok,
+                "matched_inputs": [tok],
+                "status": "UNAVAILABLE",
+                "attack_id": None,
+                "name": None,
+                "stix_id": None,
+                "revoked": False,
+                "deprecated": False,
+                "detection_strategy_ids": [],
+                "analytic_ids": [],
+                "data_component_ids": [],
+                "platforms": [],
+                "log_sources": [],
+                "error": f"Failed to load detection data for domain '{dom}': {e}",
+            }
+            for tok in sorted(unique_tokens)
+        ]
+        return _error_response(
+            "DOMAIN_UNAVAILABLE",
+            f"Failed to load detection data for domain '{dom}': {e}",
+            techniques_list=unavailable_rows,
+            exists=False,
+        )
+
+    tech_by_stix_id = v20_idx.get("tech_by_stix_id", {})
+    tech_by_attack_id = v20_idx.get("tech_by_attack_id", {})
+    tech_aid_map = v20_idx.get("tech_attack_id_by_id", {})
+    ds_by_id = v20_idx["ds_by_id"]
+    an_by_id = v20_idx["an_by_id"]
+    dc_by_id = v20_idx["dc_by_id"]
+    ds_aid_map = v20_idx.get("ds_attack_id_by_id", {})
+    an_aid_map = v20_idx.get("an_attack_id_by_id", {})
+    dc_aid_map = v20_idx.get("dc_attack_id_by_id", {})
+    tech_to_ds = v20_idx["tech_to_ds"]
+    an_to_dcs = v20_idx["an_to_dcs"]
+    an_log_source_refs = v20_idx.get("an_log_source_refs", {})
+
+    def _lookup_aid(cache_map: Dict[str, Optional[str]], stix_id: str) -> str:
+        aid = cache_map.get(stix_id)
+        if aid:
+            return str(aid)
+        try:
+            resolved = ad.get_attack_id(stix_id)
+            if resolved:
+                return str(resolved)
+        except Exception:
+            pass
+        return stix_id
+
+    resolved_by_stix: Dict[str, Dict[str, Any]] = {}
+    unresolved_rows: List[Dict[str, Any]] = []
+
+    ds_cov: Dict[str, Dict[str, Any]] = {}
+    an_cov: Dict[str, Dict[str, Any]] = {}
+    dc_cov: Dict[str, Dict[str, Any]] = {}
+    edges_t_ds: set[Tuple[str, str]] = set()
+    edges_ds_an: set[Tuple[str, str]] = set()
+    edges_an_dc: set[Tuple[str, str]] = set()
+
+    for tok in unique_tokens:
+        is_valid_syntax = bool(
+            _TECHNIQUE_ATTACK_ID_RE.match(tok) or _TECHNIQUE_STIX_ID_RE.match(tok)
+        )
+        if not is_valid_syntax:
+            unresolved_rows.append({
+                "input": tok,
+                "matched_inputs": [tok],
+                "status": "INVALID",
+                "attack_id": None,
+                "name": None,
+                "stix_id": None,
+                "revoked": False,
+                "deprecated": False,
+                "detection_strategy_ids": [],
+                "analytic_ids": [],
+                "data_component_ids": [],
+                "platforms": [],
+                "log_sources": [],
+                "error": (
+                    f"Malformed or non-technique identifier '{tok}'. "
+                    "Expected Txxxx, Txxxx.xxx, or attack-pattern--<uuid>."
+                ),
+            })
+            continue
+
+        tech_obj = None
+        resolved_id = None
+        if "--" in tok:
+            tech_obj = tech_by_stix_id.get(tok.lower())
+        else:
+            tech_obj = tech_by_attack_id.get(tok.upper())
+        if tech_obj is not None:
+            resolved_id = _stix_get(tech_obj, "id")
+            err = None
+        else:
+            err = f"Technique '{tok}' not found in domain '{dom}'."
+        if resolved_id is None:
+            unresolved_rows.append({
+                "input": tok,
+                "matched_inputs": [tok],
+                "status": "NOT_FOUND",
+                "attack_id": tok if _TECHNIQUE_ATTACK_ID_RE.match(tok) else None,
+                "name": None,
+                "stix_id": tok if _TECHNIQUE_STIX_ID_RE.match(tok) else None,
+                "revoked": False,
+                "deprecated": False,
+                "detection_strategy_ids": [],
+                "analytic_ids": [],
+                "data_component_ids": [],
+                "platforms": [],
+                "log_sources": [],
+                "error": err,
+            })
+            continue
+
+        if resolved_id in resolved_by_stix:
+            existing = resolved_by_stix[resolved_id]
+            if tok not in existing["matched_inputs"]:
+                existing["matched_inputs"].append(tok)
+                existing["matched_inputs"].sort()
+                existing["input"] = existing["matched_inputs"][0]
+            dup_tokens.add(tok)
+            duplicates_removed_count += 1
+            continue
+
+        tech_aid = tech_aid_map.get(resolved_id)
+        if tech_aid is None:
+            try:
+                tech_aid = ad.get_attack_id(resolved_id)
+            except Exception:
+                tech_aid = None
+        tech_key = str(tech_aid or resolved_id)
+        tech_name = _stix_get(tech_obj, "name")
+        is_revoked = bool(_stix_get(tech_obj, "revoked", False))
+        is_deprecated = bool(_stix_get(tech_obj, "x_mitre_deprecated", False))
+
+        t_ds_ids: set[str] = set()
+        t_an_ids: set[str] = set()
+        t_dc_ids: set[str] = set()
+        t_platforms: set[str] = set()
+        t_log_sources: set[str] = set()
+
+        for ds_stix_id in tech_to_ds.get(resolved_id, []):
+            ds_obj = ds_by_id.get(ds_stix_id)
+            if ds_obj is None:
+                continue
+            ds_aid = _lookup_aid(ds_aid_map, ds_stix_id)
+            t_ds_ids.add(ds_aid)
+            edges_t_ds.add((tech_key, ds_aid))
+
+            ds_entry = ds_cov.get(ds_stix_id)
+            if ds_entry is None:
+                ds_entry = {
+                    "attack_id": ds_aid,
+                    "name": _stix_get(ds_obj, "name"),
+                    "stix_id": ds_stix_id,
+                    "_technique_ids": set(),
+                    "_analytic_ids": set(),
+                }
+                if include_description:
+                    ds_entry["description"] = _stix_get(ds_obj, "description")
+                ds_cov[ds_stix_id] = ds_entry
+            ds_entry["_technique_ids"].add(tech_key)
+
+            for an_stix_id in (_stix_get(ds_obj, "x_mitre_analytic_refs") or []):
+                an_obj = an_by_id.get(an_stix_id)
+                if an_obj is None:
+                    continue
+                an_aid = _lookup_aid(an_aid_map, an_stix_id)
+                t_an_ids.add(an_aid)
+                ds_entry["_analytic_ids"].add(an_aid)
+                edges_ds_an.add((ds_aid, an_aid))
+
+                an_platforms = sorted(
+                    {
+                        str(p).strip()
+                        for p in (_stix_get(an_obj, "x_mitre_platforms") or [])
+                        if p and str(p).strip()
+                    }
+                )
+                t_platforms.update(an_platforms)
+
+                an_entry = an_cov.get(an_stix_id)
+                if an_entry is None:
+                    an_dc_ids: List[str] = []
+                    an_dc_seen: set[str] = set()
+                    for dc_stix_id in an_to_dcs.get(an_stix_id, []):
+                        dc_obj = dc_by_id.get(dc_stix_id)
+                        dc_aid = _lookup_aid(dc_aid_map, dc_stix_id)
+                        if dc_aid not in an_dc_seen:
+                            an_dc_seen.add(dc_aid)
+                            an_dc_ids.append(dc_aid)
+                        if dc_stix_id not in dc_cov:
+                            dc_cov[dc_stix_id] = {
+                                "attack_id": dc_aid,
+                                "name": _stix_get(dc_obj, "name") if dc_obj is not None else None,
+                                "stix_id": dc_stix_id,
+                                "_log_sources": set(),
+                            }
+                    an_dc_ids.sort(key=lambda x: _attack_id_sort_key(x, "", ""))
+
+                    an_log_source_names: set[str] = set()
+                    an_log_source_details: List[Dict[str, str]] = []
+                    seen_ls: set[Tuple[str, str, str]] = set()
+                    for lr in an_log_source_refs.get(an_stix_id, []):
+                        lr_dc_stix = lr.get("data_component_stix_id")
+                        lr_dc_aid = (
+                            _lookup_aid(dc_aid_map, lr_dc_stix) if lr_dc_stix else ""
+                        )
+                        lr_name = lr.get("name") or ""
+                        lr_channel = lr.get("channel") or ""
+                        if lr_name:
+                            an_log_source_names.add(lr_name)
+                            if lr_dc_stix and lr_dc_stix in dc_cov:
+                                dc_cov[lr_dc_stix]["_log_sources"].add(lr_name)
+                        if include_description:
+                            ls_key = (lr_dc_aid, lr_name, lr_channel)
+                            if ls_key in seen_ls:
+                                continue
+                            seen_ls.add(ls_key)
+                            ls_item: Dict[str, str] = {}
+                            if lr_dc_aid:
+                                ls_item["data_component_id"] = lr_dc_aid
+                            if lr_name:
+                                ls_item["name"] = lr_name
+                            if lr_channel:
+                                ls_item["channel"] = lr_channel
+                            if ls_item:
+                                an_log_source_details.append(ls_item)
+
+                    an_entry = {
+                        "attack_id": an_aid,
+                        "name": _stix_get(an_obj, "name"),
+                        "stix_id": an_stix_id,
+                        "platforms": an_platforms,
+                        "data_component_ids": an_dc_ids,
+                        "log_sources": sorted(an_log_source_names),
+                    }
+                    if include_description:
+                        an_log_source_details.sort(
+                            key=lambda x: (
+                                x.get("data_component_id", ""),
+                                x.get("name", ""),
+                                x.get("channel", ""),
+                            )
+                        )
+                        an_entry["log_source_references"] = an_log_source_details
+                        an_entry["description"] = _stix_get(an_obj, "description")
+                    an_cov[an_stix_id] = an_entry
+
+                for dc_aid in an_entry["data_component_ids"]:
+                    t_dc_ids.add(dc_aid)
+                    edges_an_dc.add((an_aid, dc_aid))
+                t_log_sources.update(an_entry["log_sources"])
+
+        status = "FOUND" if t_ds_ids else "VALID_NO_DETECTION"
+        resolved_by_stix[resolved_id] = {
+            "input": tok,
+            "matched_inputs": [tok],
+            "status": status,
+            "attack_id": tech_aid,
+            "name": tech_name,
+            "stix_id": resolved_id,
+            "revoked": is_revoked,
+            "deprecated": is_deprecated,
+            "detection_strategy_ids": sorted(
+                t_ds_ids, key=lambda x: _attack_id_sort_key(x, "", "")
+            ),
+            "analytic_ids": sorted(
+                t_an_ids, key=lambda x: _attack_id_sort_key(x, "", "")
+            ),
+            "data_component_ids": sorted(
+                t_dc_ids, key=lambda x: _attack_id_sort_key(x, "", "")
+            ),
+            "platforms": sorted(t_platforms),
+            "log_sources": sorted(t_log_sources),
+            "error": None,
+        }
+
+    # Finalize deterministic ordering
+    resolved_rows = sorted(
+        resolved_by_stix.values(),
+        key=lambda r: _attack_id_sort_key(r["attack_id"], r["name"], r["stix_id"]),
+    )
+    status_rank = {"NOT_FOUND": 1, "INVALID": 2, "UNAVAILABLE": 3}
+    unresolved_rows.sort(
+        key=lambda r: (status_rank.get(r["status"], 9), str(r["input"]))
+    )
+    techniques_out = resolved_rows + unresolved_rows
+
+    ds_out: List[Dict[str, Any]] = []
+    for entry in sorted(
+        ds_cov.values(),
+        key=lambda x: _attack_id_sort_key(x["attack_id"], x["name"], x["stix_id"]),
+    ):
+        item: Dict[str, Any] = {
+            "attack_id": entry["attack_id"],
+            "name": entry["name"],
+            "stix_id": entry["stix_id"],
+            "technique_ids": sorted(
+                entry["_technique_ids"], key=lambda x: _attack_id_sort_key(x, "", "")
+            ),
+            "analytic_ids": sorted(
+                entry["_analytic_ids"], key=lambda x: _attack_id_sort_key(x, "", "")
+            ),
+        }
+        if include_description:
+            item["description"] = entry.get("description")
+        ds_out.append(item)
+
+    an_out = sorted(
+        an_cov.values(),
+        key=lambda x: _attack_id_sort_key(x["attack_id"], x["name"], x["stix_id"]),
+    )
+    dc_out: List[Dict[str, Any]] = []
+    for entry in sorted(
+        dc_cov.values(),
+        key=lambda x: _attack_id_sort_key(x["attack_id"], x["name"], x["stix_id"]),
+    ):
+        dc_out.append({
+            "attack_id": entry["attack_id"],
+            "name": entry["name"],
+            "stix_id": entry["stix_id"],
+            "log_sources": sorted(entry["_log_sources"]),
+        })
+
+    edges_out = {
+        "technique_to_detection_strategy": [
+            [t_id, ds_id]
+            for t_id, ds_id in sorted(
+                edges_t_ds,
+                key=lambda p: (
+                    _attack_id_sort_key(p[0], "", ""),
+                    _attack_id_sort_key(p[1], "", ""),
+                ),
+            )
+        ],
+        "detection_strategy_to_analytic": [
+            [ds_id, an_id]
+            for ds_id, an_id in sorted(
+                edges_ds_an,
+                key=lambda p: (
+                    _attack_id_sort_key(p[0], "", ""),
+                    _attack_id_sort_key(p[1], "", ""),
+                ),
+            )
+        ],
+        "analytic_to_data_component": [
+            [an_id, dc_id]
+            for an_id, dc_id in sorted(
+                edges_an_dc,
+                key=lambda p: (
+                    _attack_id_sort_key(p[0], "", ""),
+                    _attack_id_sort_key(p[1], "", ""),
+                ),
+            )
+        ],
+    }
+
+    found_count = sum(1 for r in techniques_out if r["status"] == "FOUND")
+    no_det_count = sum(1 for r in techniques_out if r["status"] == "VALID_NO_DETECTION")
+    not_found_count = sum(1 for r in techniques_out if r["status"] == "NOT_FOUND")
+    invalid_count = sum(1 for r in techniques_out if r["status"] == "INVALID")
+    unavail_count = sum(1 for r in techniques_out if r["status"] == "UNAVAILABLE")
+
+    any_resolved = (found_count + no_det_count) > 0
+    return {
+        "found": any_resolved,
+        "batch": True,
+        "domain": dom,
+        "count": len(ds_out),
+        "counts": {
+            "requested_inputs": requested_count,
+            "unique_inputs": len(unique_tokens),
+            "duplicates_removed": duplicates_removed_count,
+            "techniques_total": len(techniques_out),
+            "found": found_count,
+            "valid_no_detection": no_det_count,
+            "not_found": not_found_count,
+            "invalid": invalid_count,
+            "unavailable": unavail_count,
+            "detection_strategies": len(ds_out),
+            "analytics": len(an_out),
+            "data_components": len(dc_out),
+        },
+        "duplicates_removed": sorted(dup_tokens),
+        "techniques": techniques_out,
+        "coverage": {
+            "detection_strategies": ds_out,
+            "analytics": an_out,
+            "data_components": dc_out,
+            "edges": edges_out,
+        },
+        "metadata": _build_detection_batch_metadata(
+            dom, include_description=include_description, exists=True
+        ),
+        "message": (
+            f"Resolved {found_count + no_det_count} of {len(techniques_out)} technique(s) "
+            f"in domain '{dom}': {len(ds_out)} unique detection strategy(ies), "
+            f"{len(an_out)} analytic(s), {len(dc_out)} data component(s)."
+        ),
+    }
+
+
 @mcp.tool()
 async def get_detection_strategies_for_technique(
-    technique_stix_id: str,
+    technique_stix_id: str = "",
     domain: str = "enterprise",
     include_description: bool = False,
+    technique_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Get ATT&CK v20.1 detection strategies (DETxxxx), analytics (ANxxxx), and
-    referenced data components (DCxxxx) that detect a given technique.
+    referenced data components (DCxxxx) for one or more techniques.
 
-    Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1190").
+    Single-technique mode (default when a single ID is passed via `technique_stix_id`
+    and `technique_ids` is omitted):
+      - Accepts a STIX ID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
+      - Preserves the exact single-technique response schema.
+
+    Batch mode (triggered when `technique_ids` is provided OR `technique_stix_id`
+    contains comma-separated IDs such as "T1190,T1059.001,T1003"):
+      - Accepts up to 50 unique technique IDs (ATT&CK IDs and/or STIX IDs).
+      - Returns deterministic, deduplicated per-technique mappings (with explicit
+        FOUND / VALID_NO_DETECTION / NOT_FOUND / INVALID / UNAVAILABLE statuses),
+        unique aggregated DET/AN/DC coverage with explicit association edges,
+        and release/provenance metadata with coverage caveat.
 
     Args:
-        technique_stix_id: Technique STIX ID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
+        technique_stix_id: Single technique STIX/ATT&CK ID (e.g., "T1190") or
+            comma-separated technique IDs (e.g., "T1190,T1059.001,T1003").
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Whether to include strategy and analytic descriptions.
+        technique_ids: Optional list of technique STIX/ATT&CK IDs for batch lookup.
     """
+    is_batch = technique_ids is not None or (
+        isinstance(technique_stix_id, str) and "," in technique_stix_id
+    )
+    if is_batch:
+        return _get_detection_strategies_batch(
+            technique_stix_id=technique_stix_id,
+            technique_ids=technique_ids,
+            domain=domain,
+            include_description=include_description,
+        )
+
     ad = get_attack_data(domain)
     resolved_id, _tech_obj, err = _resolve_stix_object(
         technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
