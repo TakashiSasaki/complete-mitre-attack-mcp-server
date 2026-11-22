@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, List, Tuple, Dict, Any, Optional
+from typing import Annotated, List, Literal, Tuple, Dict, Any, Optional
 import os
 import sys
 
@@ -40,6 +40,46 @@ PageOffset = Annotated[
         description="Zero-based starting index for pagination (>= 0).",
     ),
 ]
+AttributionFilter = Annotated[
+    Literal["all", "direct", "campaign"],
+    Field(
+        default="all",
+        description=(
+            "Filter techniques by attribution provenance: 'all' (default), "
+            "'direct' (direct group uses, including 'both'), or "
+            "'campaign' (campaign-attributed uses, including 'both')."
+        ),
+    ),
+]
+
+_VALID_ATTRIBUTION_FILTERS = ("all", "direct", "campaign")
+
+
+def _validate_attribution_filter(attribution_filter: str) -> str:
+    """Validate and normalize attribution_filter to 'all', 'direct', or 'campaign'."""
+    if not isinstance(attribution_filter, str):
+        raise ValueError(
+            f"Invalid attribution_filter {attribution_filter!r}: "
+            f"must be one of {', '.join(_VALID_ATTRIBUTION_FILTERS)}."
+        )
+    normalized = attribution_filter.strip().lower()
+    if normalized not in _VALID_ATTRIBUTION_FILTERS:
+        raise ValueError(
+            f"Invalid attribution_filter {attribution_filter!r}: "
+            f"must be one of {', '.join(_VALID_ATTRIBUTION_FILTERS)}."
+        )
+    return normalized
+
+
+def _matches_attribution_filter(attribution_source: str, attribution_filter: str) -> bool:
+    """Return True if an entry's attribution_source satisfies attribution_filter."""
+    if attribution_filter == "all":
+        return True
+    if attribution_filter == "direct":
+        return attribution_source in ("direct", "both")
+    if attribution_filter == "campaign":
+        return attribution_source in ("campaign", "both")
+    return True
 
 
 def _validate_pagination(limit: int, offset: int) -> Tuple[int, int]:
@@ -2264,6 +2304,8 @@ async def get_group_techniques(
     limit: PageLimit = DEFAULT_PAGE_LIMIT,
     offset: PageOffset = 0,
     include_formatted: bool = True,
+    include_relationships: bool = True,
+    attribution_filter: AttributionFilter = "all",
 ) -> Dict[str, Any]:
     """
     Get all techniques used by a specific APT group (intrusion set), with pagination.
@@ -2281,6 +2323,8 @@ async def get_group_techniques(
         limit: Maximum number of techniques to return per page (1-200).
         offset: Zero-based starting index for pagination (>= 0).
         include_formatted: If False, omits the human-readable formatted block to save tokens.
+        include_relationships: If False, returns empty relationship arrays per technique to reduce payload size while preserving attribution_source.
+        attribution_filter: Filter by attribution provenance ('all', 'direct', or 'campaign').
 
     Returns:
         {
@@ -2323,6 +2367,7 @@ async def get_group_techniques(
         }
     """
     safe_limit, safe_offset = _validate_pagination(limit, offset)
+    safe_attr_filter = _validate_attribution_filter(attribution_filter)
     attack_data = get_attack_data(domain)
 
     # --- 1) Find the group by name or alias (exact match first, same semantics as get_group_by_name) ---
@@ -2390,7 +2435,7 @@ async def get_group_techniques(
     # rel_entries is a list of RelationshipEntry[AttackPattern]:
     # each entry is like { "object": <Technique>, "relationships": [<Relationship>, ...] }
 
-    normalized_entries: List[Tuple[Tuple[int, str, str, str], Any, Optional[str], Optional[str], Optional[str], List[Any]]] = []
+    normalized_entries: List[Tuple[Tuple[int, str, str, str], Any, Optional[str], Optional[str], Optional[str], str, List[Dict[str, Any]]]] = []
 
     for entry in rel_entries:
         if isinstance(entry, dict):
@@ -2403,6 +2448,11 @@ async def get_group_techniques(
         if tech_obj is None:
             continue
 
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
+        attribution_source = _classify_group_technique_attribution(relationships_info, group_stix_id)
+        if not _matches_attribution_filter(attribution_source, safe_attr_filter):
+            continue
+
         t_name = _stix_get(tech_obj, "name")
         t_stix_id = _stix_get(tech_obj, "id")
         try:
@@ -2411,7 +2461,15 @@ async def get_group_techniques(
             t_attack_id = None
 
         normalized_entries.append(
-            (_attack_id_sort_key(t_attack_id, t_name, t_stix_id), tech_obj, t_attack_id, t_name, t_stix_id, rels)
+            (
+                _attack_id_sort_key(t_attack_id, t_name, t_stix_id),
+                tech_obj,
+                t_attack_id,
+                t_name,
+                t_stix_id,
+                attribution_source,
+                relationships_info if include_relationships else [],
+            )
         )
 
     normalized_entries.sort(key=lambda item: item[0])
@@ -2422,11 +2480,9 @@ async def get_group_techniques(
     techniques_structured: List[Dict[str, Any]] = []
     technique_objects_for_format: List[Any] = []
 
-    for _sort_key, tech_obj, t_attack_id, t_name, t_stix_id, rels in page_entries:
+    for _sort_key, tech_obj, t_attack_id, t_name, t_stix_id, attribution_source, relationships_info in page_entries:
         technique_objects_for_format.append(tech_obj)
         t_desc = _stix_get(tech_obj, "description") if include_description else None
-        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
-        attribution_source = _classify_group_technique_attribution(relationships_info, group_stix_id)
 
         techniques_structured.append(
             {
@@ -3188,6 +3244,8 @@ async def get_techniques_used_by_group(
     limit: PageLimit = DEFAULT_PAGE_LIMIT,
     offset: PageOffset = 0,
     include_formatted: bool = True,
+    include_relationships: bool = True,
+    attribution_filter: AttributionFilter = "all",
 ) -> Dict[str, Any]:
     """
     Get all techniques used by a specific APT group, identified by its STIX ID or ATT&CK ID,
@@ -3203,6 +3261,8 @@ async def get_techniques_used_by_group(
         limit: Maximum number of techniques to return per page (1-200).
         offset: Zero-based starting index for pagination (>= 0).
         include_formatted: If False, omits the human-readable formatted block to save tokens.
+        include_relationships: If False, returns empty relationship arrays per technique to reduce payload size while preserving attribution_source.
+        attribution_filter: Filter by attribution provenance ('all', 'direct', or 'campaign').
 
     Returns:
         {
@@ -3244,6 +3304,7 @@ async def get_techniques_used_by_group(
         }
     """
     safe_limit, safe_offset = _validate_pagination(limit, offset)
+    safe_attr_filter = _validate_attribution_filter(attribution_filter)
     attack_data = get_attack_data(domain)
 
     resolved_id, grp_obj, err = _resolve_stix_object(
@@ -3305,7 +3366,7 @@ async def get_techniques_used_by_group(
             ),
         }
 
-    normalized_entries: List[Tuple[Tuple[int, str, str, str], Any, Optional[str], Optional[str], Optional[str], List[Any]]] = []
+    normalized_entries: List[Tuple[Tuple[int, str, str, str], Any, Optional[str], Optional[str], Optional[str], str, List[Dict[str, Any]]]] = []
 
     for entry in rel_entries:
         if isinstance(entry, dict) and "object" in entry:
@@ -3321,6 +3382,11 @@ async def get_techniques_used_by_group(
         if tech_obj is None:
             continue
 
+        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
+        attribution_source = _classify_group_technique_attribution(relationships_info, group_stix_id)
+        if not _matches_attribution_filter(attribution_source, safe_attr_filter):
+            continue
+
         t_name = _stix_get(tech_obj, "name")
         t_stix_id = _stix_get(tech_obj, "id")
         try:
@@ -3329,7 +3395,15 @@ async def get_techniques_used_by_group(
             t_attack_id = None
 
         normalized_entries.append(
-            (_attack_id_sort_key(t_attack_id, t_name, t_stix_id), tech_obj, t_attack_id, t_name, t_stix_id, rels)
+            (
+                _attack_id_sort_key(t_attack_id, t_name, t_stix_id),
+                tech_obj,
+                t_attack_id,
+                t_name,
+                t_stix_id,
+                attribution_source,
+                relationships_info if include_relationships else [],
+            )
         )
 
     normalized_entries.sort(key=lambda item: item[0])
@@ -3340,11 +3414,9 @@ async def get_techniques_used_by_group(
     techniques_structured: List[Dict[str, Any]] = []
     technique_objects_for_format: List[Any] = []
 
-    for _sort_key, tech_obj, t_attack_id, t_name, t_stix_id, rels in page_entries:
+    for _sort_key, tech_obj, t_attack_id, t_name, t_stix_id, attribution_source, relationships_info in page_entries:
         technique_objects_for_format.append(tech_obj)
         t_desc = _stix_get(tech_obj, "description") if include_description else None
-        relationships_info = [_format_rel_edge(r, include_description=include_description) for r in rels]
-        attribution_source = _classify_group_technique_attribution(relationships_info, group_stix_id)
 
         techniques_structured.append(
             {
@@ -3864,6 +3936,7 @@ async def get_techniques_used_by_group_software(
     limit: PageLimit = DEFAULT_PAGE_LIMIT,
     offset: PageOffset = 0,
     include_formatted: bool = True,
+    include_relationships: bool = True,
 ) -> Dict[str, Any]:
     """
     Get techniques used by the software that a group uses (Group → Software → Techniques),
@@ -3881,6 +3954,7 @@ async def get_techniques_used_by_group_software(
         limit: Maximum number of techniques to return per page (1-200).
         offset: Zero-based starting index for pagination (>= 0).
         include_formatted: If False, omits the human-readable formatted block to save tokens.
+        include_relationships: If False, returns empty relationships and provenance_paths arrays per technique to reduce payload size.
 
     Returns:
         {
@@ -4170,8 +4244,8 @@ async def get_techniques_used_by_group_software(
                 "name": t_name,
                 "stix_id": t_stix_id,
                 "description": t_desc,
-                "relationships": rels_sorted,
-                "provenance_paths": paths_sorted,
+                "relationships": rels_sorted if include_relationships else [],
+                "provenance_paths": paths_sorted if include_relationships else [],
             }
         )
 
@@ -10540,68 +10614,113 @@ async def get_revoked_techniques(
 
 @mcp.tool()
 async def generate_layer(
-    attack_id: str,
+    attack_id: str = "",
     score: int = 1,
     domain: str = "enterprise",
+    attack_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Generate an ATT&CK Navigator layer for visualization.
+    Generate an ATT&CK Navigator layer for visualization with deterministic technique sorting.
 
-    This wraps mitreattack.navlayers.UsageLayerGenerator and produces a
-    JSON layer highlighting techniques associated with a given ATT&CK ID.
+    Produces a Navigator v4.5 JSON layer (pinned to the active ATT&CK dataset release, v20.1)
+    highlighting active techniques associated with one or more ATT&CK IDs.
 
-    Only the following ATT&CK ID prefixes are supported:
+    Supported ATT&CK ID prefixes:
       - Gxxxx : groups (intrusion sets)
       - Mxxxx : mitigations (course-of-action)
       - Sxxxx : software (tool/malware)
       - Cxxxx : campaigns
       - DCxxxx : data components (ATT&CK v20.1; legacy Dxxxx also accepted)
+      - Txxxx / Txxxx.xxx : techniques and sub-techniques
 
-    Technique IDs (Txxxx / Txxxx.xxx) are NOT supported here.
+    Multiple IDs may be provided either as a comma-separated `attack_id` string
+    (e.g., "T1190, T1059.001") or via the `attack_ids` list (e.g., ["T1190", "G0016"]).
 
     Args:
-        attack_id: ATT&CK ID (Gxxxx, Mxxxx, Sxxxx, Cxxxx, or DCxxxx)
-        score: Score to assign to all matched techniques in the layer
-        domain: ATT&CK domain (e.g., "enterprise", "mobile", "ics")
+        attack_id: Single ATT&CK ID or comma-separated ATT&CK IDs (Gxxxx, Mxxxx, Sxxxx, Cxxxx, DCxxxx/Dxxxx, or Txxxx/Txxxx.xxx).
+        score: Score to assign to all matched techniques in the layer.
+        domain: ATT&CK domain ("enterprise", "mobile", or "ics").
+        attack_ids: Optional list of ATT&CK IDs to combine into a single layer.
 
     Returns:
         {
           "success": bool,
-          "attack_id": "<G/M/S/C/DC ID>",
+          "attack_id": "<normalized ID or comma-separated IDs>",
+          "attack_ids": ["<ID>", ...],
           "domain": "<domain>",
-          "count": int,              # number of techniques in layer
-          "layer": { ... } | null,   # ATT&CK Navigator layer JSON
+          "count": int,              # number of unique active techniques in layer
+          "layer": { ... } | null,   # ATT&CK Navigator layer JSON (techniques sorted deterministically)
           "message": "<summary or error>"
         }
     """
     import re
 
     domain = (domain or "enterprise").strip().lower()
-    attack_id = (attack_id or "").strip().upper()
+
+    # Collect and normalize one or more ATT&CK IDs (deduplicated, preserving order)
+    raw_tokens: List[str] = []
+    if isinstance(attack_id, str) and attack_id.strip():
+        raw_tokens.extend(part.strip() for part in attack_id.split(","))
+    if attack_ids is not None:
+        for item in attack_ids:
+            if isinstance(item, str):
+                raw_tokens.extend(part.strip() for part in item.split(","))
+            else:
+                raw_tokens.append(str(item).strip())
+
+    normalized_ids: List[str] = []
+    seen_input_ids = set()
+    for tok in raw_tokens:
+        if not tok:
+            continue
+        up = tok.upper()
+        if up not in seen_input_ids:
+            seen_input_ids.add(up)
+            normalized_ids.append(up)
+
+    display_id = ", ".join(normalized_ids)
 
     if domain not in DOMAINS:
         return {
             "success": False,
-            "attack_id": attack_id,
+            "attack_id": display_id,
+            "attack_ids": normalized_ids,
             "domain": domain,
             "count": 0,
             "layer": None,
             "message": f"Invalid domain '{domain}'. Must be one of: {', '.join(DOMAINS)}.",
         }
 
-    # Validate ATT&CK ID format: Gxxxx, Mxxxx, Sxxxx, Cxxxx, Dxxxx, or DCxxxx (v20.1 data component)
-    if not re.match(r"^(?:[CGMSD]|DC)\d+$", attack_id):
+    if not normalized_ids:
         return {
             "success": False,
-            "attack_id": attack_id,
+            "attack_id": "",
+            "attack_ids": [],
             "domain": domain,
             "count": 0,
             "layer": None,
             "message": (
-                f"Invalid ATT&CK ID format: '{attack_id}'. Must be "
+                "No ATT&CK ID provided. Supply attack_id or attack_ids with valid "
                 "GXXXX (group), MXXXX (mitigation), SXXXX (software), CXXXX (campaign), "
-                "or DCXXXX/DXXXX (data component). "
-                "Technique IDs (TXXXX) are not supported."
+                "DCXXXX/DXXXX (data component), or TXXXX/TXXXX.XXX (technique) IDs."
+            ),
+        }
+
+    # Validate ATT&CK ID formats: Gxxxx, Mxxxx, Sxxxx, Cxxxx, DCxxxx/Dxxxx, or Txxxx/Txxxx.xxx
+    valid_id_re = re.compile(r"^(?:(?:[CGMSD]|DC)\d+|T\d+(?:\.\d+)?)$")
+    invalid_ids = [aid for aid in normalized_ids if not valid_id_re.match(aid)]
+    if invalid_ids:
+        return {
+            "success": False,
+            "attack_id": display_id,
+            "attack_ids": normalized_ids,
+            "domain": domain,
+            "count": 0,
+            "layer": None,
+            "message": (
+                f"Invalid ATT&CK ID format: {', '.join(repr(x) for x in invalid_ids)}. Must be "
+                "GXXXX (group), MXXXX (mitigation), SXXXX (software), CXXXX (campaign), "
+                "DCXXXX/DXXXX (data component), or TXXXX/TXXXX.XXX (technique)."
             ),
         }
 
@@ -10609,7 +10728,8 @@ async def generate_layer(
     if not stix_path.exists():
         return {
             "success": False,
-            "attack_id": attack_id,
+            "attack_id": display_id,
+            "attack_ids": normalized_ids,
             "domain": domain,
             "count": 0,
             "layer": None,
@@ -10619,100 +10739,159 @@ async def generate_layer(
     # Generate Navigator layer directly from loaded MitreAttackData for complete v20.1 accuracy
     try:
         ad = get_attack_data(domain)
-        src_obj = None
-        raw_items: List[Any] = []
-        relation_label = "Associated with"
+        tech_map: Dict[str, Dict[str, Any]] = {}
+        tech_comments: Dict[str, List[str]] = {}
+        resolved_sources: List[Tuple[str, str]] = []
+        missing_ids: List[str] = []
 
-        if attack_id.startswith("G"):
-            src_obj = ad.get_object_by_attack_id(attack_id, "intrusion-set")
-            if src_obj is not None:
-                raw_items = ad.get_techniques_used_by_group(_stix_get(src_obj, "id")) or []
-                relation_label = "Used by group"
-        elif attack_id.startswith("M"):
-            src_obj = ad.get_object_by_attack_id(attack_id, "course-of-action")
-            if src_obj is not None:
-                raw_items = ad.get_techniques_mitigated_by_mitigation(_stix_get(src_obj, "id")) or []
-                relation_label = "Mitigated by"
-        elif attack_id.startswith("S"):
-            src_obj = ad.get_object_by_attack_id(attack_id, "malware") or ad.get_object_by_attack_id(attack_id, "tool")
-            if src_obj is not None:
-                raw_items = ad.get_techniques_used_by_software(_stix_get(src_obj, "id")) or []
-                relation_label = "Used by software"
-        elif attack_id.startswith("C"):
-            src_obj = ad.get_object_by_attack_id(attack_id, "campaign")
-            if src_obj is not None:
-                raw_items = ad.get_techniques_used_by_campaign(_stix_get(src_obj, "id")) or []
-                relation_label = "Used by campaign"
-        elif attack_id.startswith("DC") or attack_id.startswith("D"):
-            src_obj = ad.get_object_by_attack_id(attack_id, "x-mitre-data-component")
-            if src_obj is not None:
-                dc_stix_id = _stix_get(src_obj, "id")
-                v20_idx = _get_v20_detection_index(domain)
-                for tid in v20_idx["dc_to_techs"].get(dc_stix_id, []):
-                    tobj = ad.get_object_by_stix_id(tid)
-                    if tobj is not None:
-                        raw_items.append(tobj)
-                if not raw_items:
-                    raw_items = ad.get_techniques_detected_by_datacomponent(dc_stix_id) or []
-                relation_label = "Detected via data component"
+        for aid in normalized_ids:
+            src_obj = None
+            raw_items: List[Any] = []
+            relation_label = "Associated with"
 
-        if src_obj is None:
+            if aid.startswith("T"):
+                src_obj = ad.get_object_by_attack_id(aid, "attack-pattern")
+                if src_obj is not None:
+                    raw_items = [src_obj]
+                    relation_label = "Technique"
+            elif aid.startswith("G"):
+                src_obj = ad.get_object_by_attack_id(aid, "intrusion-set")
+                if src_obj is not None:
+                    raw_items = ad.get_techniques_used_by_group(_stix_get(src_obj, "id")) or []
+                    relation_label = "Used by group"
+            elif aid.startswith("M"):
+                src_obj = ad.get_object_by_attack_id(aid, "course-of-action")
+                if src_obj is not None:
+                    raw_items = ad.get_techniques_mitigated_by_mitigation(_stix_get(src_obj, "id")) or []
+                    relation_label = "Mitigated by"
+            elif aid.startswith("S"):
+                src_obj = ad.get_object_by_attack_id(aid, "malware") or ad.get_object_by_attack_id(aid, "tool")
+                if src_obj is not None:
+                    raw_items = ad.get_techniques_used_by_software(_stix_get(src_obj, "id")) or []
+                    relation_label = "Used by software"
+            elif aid.startswith("C"):
+                src_obj = ad.get_object_by_attack_id(aid, "campaign")
+                if src_obj is not None:
+                    raw_items = ad.get_techniques_used_by_campaign(_stix_get(src_obj, "id")) or []
+                    relation_label = "Used by campaign"
+            elif aid.startswith("DC") or aid.startswith("D"):
+                src_obj = ad.get_object_by_attack_id(aid, "x-mitre-data-component")
+                if src_obj is not None:
+                    dc_stix_id = _stix_get(src_obj, "id")
+                    v20_idx = _get_v20_detection_index(domain)
+                    for tid in v20_idx["dc_to_techs"].get(dc_stix_id, []):
+                        tobj = ad.get_object_by_stix_id(tid)
+                        if tobj is not None:
+                            raw_items.append(tobj)
+                    if not raw_items:
+                        raw_items = ad.get_techniques_detected_by_datacomponent(dc_stix_id) or []
+                    relation_label = "Detected via data component"
+
+            if src_obj is None:
+                missing_ids.append(aid)
+                continue
+
+            src_name = _stix_get(src_obj, "name") or aid
+            resolved_sources.append((aid, src_name))
+
+            for item in raw_items:
+                tobj = _unwrap_stix_object(item)
+                if tobj is None or _stix_get(tobj, "revoked", False) or _stix_get(tobj, "x_mitre_deprecated", False):
+                    continue
+                tid = _stix_get(tobj, "id")
+                t_aid = ad.get_attack_id(tid) if tid else None
+                if not t_aid:
+                    continue
+
+                if aid.startswith("T"):
+                    comment = f"Technique: {src_name} ({t_aid})"
+                else:
+                    comment = f"{relation_label} {src_name} ({aid})"
+                    if isinstance(item, dict) and item.get("relationships"):
+                        r_desc = _stix_get(item["relationships"][0], "description")
+                        if isinstance(r_desc, str) and r_desc.strip():
+                            clean_desc = " ".join(r_desc.strip().split())
+                            comment = clean_desc[:197] + "..." if len(clean_desc) > 200 else clean_desc
+
+                comments_list = tech_comments.setdefault(t_aid, [])
+                if comment not in comments_list:
+                    comments_list.append(comment)
+
+                if t_aid not in tech_map:
+                    tech_map[t_aid] = {
+                        "techniqueID": t_aid,
+                        "score": score,
+                        "comment": comment,
+                        "enabled": True,
+                    }
+
+        if missing_ids:
+            if len(missing_ids) == 1 and len(normalized_ids) == 1:
+                missing_msg = f"ATT&CK object '{missing_ids[0]}' was not found in domain '{domain}'."
+            else:
+                missing_msg = (
+                    f"ATT&CK object(s) not found in domain '{domain}': "
+                    f"{', '.join(missing_ids)}."
+                )
             return {
                 "success": False,
-                "attack_id": attack_id,
+                "attack_id": display_id,
+                "attack_ids": normalized_ids,
                 "domain": domain,
                 "count": 0,
                 "layer": None,
-                "message": f"ATT&CK object '{attack_id}' was not found in domain '{domain}'.",
+                "message": missing_msg,
             }
 
-        src_name = _stix_get(src_obj, "name") or attack_id
-        seen_tids = set()
         tech_entries: List[Dict[str, Any]] = []
-        for item in raw_items:
-            tobj = _unwrap_stix_object(item)
-            if tobj is None or _stix_get(tobj, "revoked", False) or _stix_get(tobj, "x_mitre_deprecated", False):
-                continue
-            tid = _stix_get(tobj, "id")
-            t_aid = ad.get_attack_id(tid) if tid else None
-            if not t_aid or t_aid in seen_tids:
-                continue
-            seen_tids.add(t_aid)
-
-            # Extract concise comment from relationship description if present
-            comment = f"{relation_label} {src_name} ({attack_id})"
-            if isinstance(item, dict) and item.get("relationships"):
-                r_desc = _stix_get(item["relationships"][0], "description")
-                if isinstance(r_desc, str) and r_desc.strip():
-                    clean_desc = " ".join(r_desc.strip().split())
-                    comment = clean_desc[:197] + "..." if len(clean_desc) > 200 else clean_desc
-
-            tech_entries.append({
-                "techniqueID": t_aid,
-                "score": score,
-                "comment": comment,
-                "enabled": True,
-            })
+        for t_aid in sorted(tech_map.keys(), key=lambda tid: _attack_id_sort_key(tid, "", "")):
+            entry = tech_map[t_aid]
+            joined_comment = " | ".join(tech_comments[t_aid])
+            entry["comment"] = joined_comment[:197] + "..." if len(joined_comment) > 200 else joined_comment
+            tech_entries.append(entry)
 
         if not tech_entries:
+            if len(resolved_sources) == 1:
+                only_id, only_name = resolved_sources[0]
+                empty_msg = f"No active techniques found for '{only_id}' ({only_name}) in domain '{domain}'."
+            else:
+                empty_msg = f"No active techniques found for '{display_id}' in domain '{domain}'."
             return {
                 "success": False,
-                "attack_id": attack_id,
+                "attack_id": display_id,
+                "attack_ids": normalized_ids,
                 "domain": domain,
                 "count": 0,
                 "layer": None,
-                "message": f"No active techniques found for '{attack_id}' ({src_name}) in domain '{domain}'.",
+                "message": empty_msg,
             }
 
+        if len(resolved_sources) == 1:
+            only_id, only_name = resolved_sources[0]
+            layer_name = f"{only_name} ({only_id})"
+            layer_desc = (
+                f"ATT&CK Navigator layer for {only_name} ({only_id}) "
+                f"in {domain} v{release_info.LATEST_VERSION}."
+            )
+        else:
+            preview = ", ".join(normalized_ids[:5])
+            if len(normalized_ids) > 5:
+                preview += f", +{len(normalized_ids) - 5} more"
+            layer_name = f"Combined ATT&CK Layer ({preview})"
+            layer_desc = (
+                f"ATT&CK Navigator layer for {len(normalized_ids)} ATT&CK IDs "
+                f"({display_id}) in {domain} v{release_info.LATEST_VERSION}."
+            )
+
         layer_dict = {
-            "name": f"{src_name} ({attack_id})",
+            "name": layer_name,
             "versions": {
                 "attack": str(release_info.LATEST_VERSION),
                 "navigator": "5.1.0",
                 "layer": "4.5",
             },
             "domain": f"{domain}-attack",
-            "description": f"ATT&CK Navigator layer for {src_name} ({attack_id}) in {domain} v{release_info.LATEST_VERSION}.",
+            "description": layer_desc,
             "layout": {
                 "layout": "side",
                 "aggregateFunction": "average",
@@ -10729,12 +10908,13 @@ async def generate_layer(
 
         return {
             "success": True,
-            "attack_id": attack_id,
+            "attack_id": display_id,
+            "attack_ids": normalized_ids,
             "domain": domain,
             "count": count,
             "layer": layer_dict,
             "message": (
-                f"Generated Navigator layer for '{attack_id}' in domain "
+                f"Generated Navigator layer for '{display_id}' in domain "
                 f"'{domain}' with {count} technique(s)."
             ),
         }
@@ -10742,7 +10922,8 @@ async def generate_layer(
     except Exception as e:
         return {
             "success": False,
-            "attack_id": attack_id,
+            "attack_id": display_id,
+            "attack_ids": normalized_ids,
             "domain": domain,
             "count": 0,
             "layer": None,

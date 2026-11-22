@@ -223,8 +223,8 @@ class TestWave2GenerateLayerCampaigns(unittest.TestCase):
         self.assertFalse(missing["success"])
         self.assertIsNone(missing["layer"])
 
-        # Invalid prefix error message mentions CXXXX
-        bad = asyncio.run(srv.generate_layer("T1190", domain="enterprise"))
+        # Invalid prefix error message mentions CXXXX and TXXXX
+        bad = asyncio.run(srv.generate_layer("X9999", domain="enterprise"))
         self.assertFalse(bad["success"])
         self.assertIn("CXXXX", bad["message"])
 
