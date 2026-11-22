@@ -826,6 +826,69 @@ _LEGACY_TACTIC_MIGRATIONS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+
+def _normalize_technique_platforms(
+    platforms: Optional[List[str]],
+    techniques: Optional[List[Any]] = None,
+) -> Optional[List[str]]:
+    """Normalize an optional list of platform filter names for technique queries.
+
+    Returns None when no non-empty platform filter is requested (preserving
+    unfiltered backward-compatible behavior). When provided, resolves canonical
+    platform casing from known techniques when available and returns a
+    deduplicated, deterministically sorted list.
+    """
+    if platforms is None:
+        return None
+    raw_items = [str(p).strip() for p in platforms if p is not None and str(p).strip()]
+    if not raw_items:
+        return None
+
+    known_lower: Dict[str, str] = {}
+    if techniques:
+        for tech in techniques:
+            for p in (_stix_get(tech, "x_mitre_platforms") or []):
+                if p and str(p).strip():
+                    ps = str(p).strip()
+                    known_lower[ps.lower()] = ps
+
+    dedup: Dict[str, str] = {}
+    for item in raw_items:
+        key = item.lower()
+        if key not in dedup:
+            dedup[key] = known_lower.get(key, item)
+    return sorted(dedup.values())
+
+
+def _technique_matches_platforms(tech: Any, platform_set_lower: set[str]) -> bool:
+    """Return True if technique applies to at least one platform in platform_set_lower."""
+    tech_platforms = _stix_get(tech, "x_mitre_platforms", []) or []
+    return any(
+        str(p).strip().lower() in platform_set_lower
+        for p in tech_platforms
+        if p is not None and str(p).strip()
+    )
+
+
+def _extract_dc_log_sources(dc: Any) -> List[Dict[str, str]]:
+    """Extract normalized ATT&CK v20.1 `x_mitre_log_sources` entries from a data component."""
+    raw = _stix_get(dc, "x_mitre_log_sources") or _stix_get(dc, "x-mitre-log-sources") or []
+    result: List[Dict[str, str]] = []
+    if not isinstance(raw, (list, tuple)):
+        return result
+    for entry in raw:
+        if isinstance(entry, dict):
+            ls_name = entry.get("name")
+            ls_channel = entry.get("channel")
+        else:
+            ls_name = getattr(entry, "name", None)
+            ls_channel = getattr(entry, "channel", None)
+        name_str = str(ls_name) if ls_name is not None else ""
+        channel_str = str(ls_channel) if ls_channel is not None else ""
+        if name_str or channel_str:
+            result.append({"name": name_str, "channel": channel_str})
+    return result
+
 _V20_DETECTION_CACHE: Dict[str, Dict[str, Any]] = {}
 _V20_MITIGATION_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -1898,18 +1961,31 @@ async def get_techniques_by_tactic(
     limit: PageLimit = DEFAULT_PAGE_LIMIT,
     offset: PageOffset = 0,
     include_formatted: bool = True,
+    platforms: Annotated[
+        Optional[List[str]],
+        Field(
+            default=None,
+            description=(
+                "Optional list of target platforms (case-insensitive, e.g. ['Linux', 'Windows', 'ESXi', 'Containers']). "
+                "When provided, filters techniques to those applicable to at least one requested platform "
+                "and includes `applied_platforms` in the response."
+            ),
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """
     Get all techniques associated with a specific ATT&CK tactic.
 
     This uses the MITRE ATT&CK Navigator-style mapping between tactics and
     techniques for a given domain (e.g., "enterprise-attack").
+    When an unrecognized tactic produces 0 matches, returns `available_tactics`
+    listing valid tactic names for the requested domain so callers can self-correct in one step.
 
     Examples:
         - get_techniques_by_tactic("Initial Access", "enterprise")
         - get_techniques_by_tactic("Stealth", "enterprise")
         - get_techniques_by_tactic("Defense Impairment", "enterprise")
-        - get_techniques_by_tactic("Persistence", "enterprise")
+        - get_techniques_by_tactic("Persistence", "enterprise", platforms=["Linux"])
 
     Args:
         tactic: Tactic name (e.g., "Initial Access", "Stealth", "Defense Impairment", "Persistence").
@@ -1919,6 +1995,8 @@ async def get_techniques_by_tactic(
         limit: Maximum number of items to return per page (1-200).
         offset: Zero-based starting index for pagination (>= 0).
         include_formatted: If False, omits the human-readable formatted block to save tokens.
+        platforms: Optional list of platform names to filter techniques by `x_mitre_platforms`
+                   (case-insensitive). Omit or pass None for all platforms.
 
     Returns:
         {
@@ -1928,6 +2006,8 @@ async def get_techniques_by_tactic(
           "limit": <limit>,
           "has_more": <bool>,
           "next_offset": <int or null>,
+          "applied_platforms": ["<platform>", ...],  # included when platforms filter is applied
+          "available_tactics": ["<tactic>", ...],    # included when 0 techniques match an unrecognized tactic
           "techniques": [
             {
               "attack_id": "<TXXXX or TXXXX.YYY>",
@@ -1947,16 +2027,20 @@ async def get_techniques_by_tactic(
 
     tactic_shortname = _normalize_tactic_shortname(attack_data, tactic)
     canonical_tactic = tactic
+    available_tactics: List[str] = []
     try:
+        tactic_names: set[str] = set()
         for t_obj in attack_data.get_tactics(remove_revoked_deprecated=True) or []:
             t_short = (_stix_get(t_obj, "x_mitre_shortname", "") or "").strip()
             t_name = (_stix_get(t_obj, "name", "") or "").strip()
+            if t_name:
+                tactic_names.add(t_name)
             if t_short.lower() == tactic_shortname.lower() or t_name.lower() == (tactic or "").strip().lower():
                 if t_name:
                     canonical_tactic = t_name
-                break
+        available_tactics = sorted(tactic_names)
     except Exception:
-        pass
+        available_tactics = []
 
     try:
         techniques = attack_data.get_techniques_by_tactic(
@@ -1968,8 +2052,20 @@ async def get_techniques_by_tactic(
         techniques = []
 
     if not techniques:
+        raw_applied_platforms = _normalize_technique_platforms(platforms)
         legacy = _LEGACY_TACTIC_MIGRATIONS.get((tactic or "").strip().lower())
-        msg = f"No techniques found for tactic '{canonical_tactic}' in domain '{domain}'."
+        avail_str = ", ".join(available_tactics) if available_tactics else "none"
+        if legacy:
+            msg = (
+                f"No techniques found for tactic '{canonical_tactic}' in domain '{domain}'. "
+                f"{legacy['hint']} "
+                f"Valid tactics for domain '{domain}': {avail_str}."
+            )
+        else:
+            msg = (
+                f"No techniques found for tactic '{canonical_tactic}' in domain '{domain}'. "
+                f"Valid tactics for domain '{domain}': {avail_str}."
+            )
         resp: Dict[str, Any] = {
             "count": 0,
             "total_count": 0,
@@ -1978,12 +2074,38 @@ async def get_techniques_by_tactic(
             "has_more": False,
             "next_offset": None,
             "techniques": [],
+            "available_tactics": available_tactics,
             "formatted": "",
-            "message": f"{msg} {legacy['hint']}" if legacy else msg,
+            "message": msg,
         }
         if legacy:
             resp["suggested_tactics"] = legacy["suggested_tactics"]
+        if raw_applied_platforms is not None:
+            resp["applied_platforms"] = raw_applied_platforms
         return resp
+
+    applied_platforms = _normalize_technique_platforms(platforms, techniques)
+    if applied_platforms is not None:
+        platform_set_lower = {p.lower() for p in applied_platforms}
+        techniques = [
+            t for t in techniques if _technique_matches_platforms(t, platform_set_lower)
+        ]
+        if not techniques:
+            return {
+                "count": 0,
+                "total_count": 0,
+                "offset": safe_offset,
+                "limit": safe_limit,
+                "has_more": False,
+                "next_offset": None,
+                "applied_platforms": applied_platforms,
+                "techniques": [],
+                "formatted": "",
+                "message": (
+                    f"No techniques found for tactic '{canonical_tactic}' in domain '{domain}' "
+                    f"(filtered by platforms: {', '.join(applied_platforms)})."
+                ),
+            }
 
     techniques_sorted = sorted(
         techniques,
@@ -2031,7 +2153,12 @@ async def get_techniques_by_tactic(
         else ""
     )
 
-    return {
+    plat_suffix = (
+        f" (filtered by platforms: {', '.join(applied_platforms)})"
+        if applied_platforms is not None
+        else ""
+    )
+    result: Dict[str, Any] = {
         "count": len(structured),
         "total_count": total_count,
         "offset": safe_offset,
@@ -2042,9 +2169,12 @@ async def get_techniques_by_tactic(
         "formatted": formatted,
         "message": (
             f"Found {total_count} technique(s) for tactic '{canonical_tactic}' "
-            f"in domain '{domain}' (returning {len(structured)} at offset {safe_offset})."
+            f"in domain '{domain}'{plat_suffix} (returning {len(structured)} at offset {safe_offset})."
         ),
     }
+    if applied_platforms is not None:
+        result["applied_platforms"] = applied_platforms
+    return result
 
 _DOMAIN_SORT_RANK: Dict[str, int] = {
     "enterprise": 0,
@@ -2132,6 +2262,7 @@ def _search_techniques_all_domains(
     offset: int,
     include_formatted: bool,
     detail_level: str = "full",
+    platforms: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Perform cross-domain search across enterprise, mobile, and ics local STIX bundles."""
     safe_limit, safe_offset = _validate_pagination(limit, offset)
@@ -2272,32 +2403,42 @@ def _search_techniques_all_domains(
     }
 
     if not query_lower:
-        return _finalize_response(
-            {
-                "domain": "all",
-                "domains_searched": list(DOMAINS),
-                "count": 0,
-                "total_count": 0,
-                "offset": safe_offset,
-                "limit": safe_limit,
-                "has_more": False,
-                "next_offset": None,
-                "techniques": [],
-                "domain_status": domain_status,
-                "metadata": metadata_ok,
-                "formatted": "",
-                "message": (
-                    f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'."
-                ),
-            }
+        raw_applied = _normalize_technique_platforms(platforms)
+        plat_suffix = (
+            f" (filtered by platforms: {', '.join(raw_applied)})"
+            if raw_applied is not None
+            else ""
         )
+        empty_resp: Dict[str, Any] = {
+            "domain": "all",
+            "domains_searched": list(DOMAINS),
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "techniques": [],
+            "domain_status": domain_status,
+            "metadata": metadata_ok,
+            "formatted": "",
+            "message": (
+                f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'{plat_suffix}."
+            ),
+        }
+        if raw_applied is not None:
+            empty_resp["applied_platforms"] = raw_applied
+        return _finalize_response(empty_resp)
 
-    # Collect matches per domain without collapsing same name or same attack_id across domains
-    matched_records: List[Tuple[str, Any, Optional[str], str, str]] = []
+    # Load all domain techniques first so platform normalization can resolve canonical casing
+    dom_techniques_map: Dict[str, List[Any]] = {}
+    all_loaded_techniques: List[Any] = []
     for dom in DOMAINS:
         ad = loaded_adapters[dom]
         try:
             dom_techniques = ad.get_techniques(remove_revoked_deprecated=True) or []
+            dom_techniques_map[dom] = dom_techniques
+            all_loaded_techniques.extend(dom_techniques)
         except Exception as e:
             domain_status[dom]["status"] = "UNAVAILABLE"
             domain_status[dom]["available"] = False
@@ -2306,11 +2447,28 @@ def _search_techniques_all_domains(
             unavailable_domains.append(dom)
             continue
 
+    applied_platforms = _normalize_technique_platforms(platforms, all_loaded_techniques)
+    platform_set_lower = (
+        {p.lower() for p in applied_platforms} if applied_platforms is not None else None
+    )
+
+    # Collect matches per domain without collapsing same name or same attack_id across domains
+    matched_records: List[Tuple[str, Any, Optional[str], str, str]] = []
+    for dom in DOMAINS:
+        if dom not in dom_techniques_map:
+            continue
+        ad = loaded_adapters[dom]
+        dom_techniques = dom_techniques_map[dom]
+
         dom_matches = 0
         for tech in dom_techniques:
             name = _stix_get(tech, "name") or ""
             description = _stix_get(tech, "description") or ""
             if query_lower in name.lower() or query_lower in description.lower():
+                if platform_set_lower is not None and not _technique_matches_platforms(
+                    tech, platform_set_lower
+                ):
+                    continue
                 dom_matches += 1
                 stix_id = _stix_get(tech, "id") or ""
                 attack_id = None
@@ -2327,49 +2485,57 @@ def _search_techniques_all_domains(
         metadata_ok["partial"] = len(unavailable_domains) < len(DOMAINS)
         metadata_ok["unavailable_domains"] = list(unavailable_domains)
         metadata_ok["freshness_status"] = "incomplete_missing_domain_bundle"
-        return _finalize_response(
-            {
-                "found": False,
-                "error_code": "DOMAIN_UNAVAILABLE",
-                "domain": "all",
-                "domains_searched": list(DOMAINS),
-                "count": 0,
-                "total_count": 0,
-                "offset": safe_offset,
-                "limit": safe_limit,
-                "has_more": False,
-                "next_offset": None,
-                "techniques": [],
-                "domain_status": domain_status,
-                "metadata": metadata_ok,
-                "formatted": "",
-                "message": (
-                    f"Cross-domain search failed closed because domain(s) "
-                    f"{', '.join(unavailable_domains)} failed during retrieval."
-                ),
-            }
-        )
+        err_resp: Dict[str, Any] = {
+            "found": False,
+            "error_code": "DOMAIN_UNAVAILABLE",
+            "domain": "all",
+            "domains_searched": list(DOMAINS),
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "techniques": [],
+            "domain_status": domain_status,
+            "metadata": metadata_ok,
+            "formatted": "",
+            "message": (
+                f"Cross-domain search failed closed because domain(s) "
+                f"{', '.join(unavailable_domains)} failed during retrieval."
+            ),
+        }
+        if applied_platforms is not None:
+            err_resp["applied_platforms"] = applied_platforms
+        return _finalize_response(err_resp)
+
+    plat_suffix = (
+        f" (filtered by platforms: {', '.join(applied_platforms)})"
+        if applied_platforms is not None
+        else ""
+    )
 
     if not matched_records:
-        return _finalize_response(
-            {
-                "domain": "all",
-                "domains_searched": list(DOMAINS),
-                "count": 0,
-                "total_count": 0,
-                "offset": safe_offset,
-                "limit": safe_limit,
-                "has_more": False,
-                "next_offset": None,
-                "techniques": [],
-                "domain_status": domain_status,
-                "metadata": metadata_ok,
-                "formatted": "",
-                "message": (
-                    f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'."
-                ),
-            }
-        )
+        no_match_resp: Dict[str, Any] = {
+            "domain": "all",
+            "domains_searched": list(DOMAINS),
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "techniques": [],
+            "domain_status": domain_status,
+            "metadata": metadata_ok,
+            "formatted": "",
+            "message": (
+                f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'{plat_suffix}."
+            ),
+        }
+        if applied_platforms is not None:
+            no_match_resp["applied_platforms"] = applied_platforms
+        return _finalize_response(no_match_resp)
 
     # Deterministic global sort: name ascending, domain rank (enterprise, mobile, ics), attack_id, stix_id
     matched_sorted = sorted(
@@ -2413,26 +2579,27 @@ def _search_techniques_all_domains(
     per_dom_summary = ", ".join(
         f"{dom}={domain_status[dom]['match_count']}" for dom in DOMAINS
     )
-    return _finalize_response(
-        {
-            "domain": "all",
-            "domains_searched": list(DOMAINS),
-            "count": len(structured),
-            "total_count": total_count,
-            "offset": safe_offset,
-            "limit": safe_limit,
-            "has_more": has_more,
-            "next_offset": next_offset,
-            "techniques": structured,
-            "domain_status": domain_status,
-            "metadata": metadata_ok,
-            "formatted": formatted,
-            "message": (
-                f"Found {total_count} technique(s) across domains ({per_dom_summary}) "
-                f"matching query '{query}' (returning {len(structured)} at offset {safe_offset})."
-            ),
-        }
-    )
+    ok_resp: Dict[str, Any] = {
+        "domain": "all",
+        "domains_searched": list(DOMAINS),
+        "count": len(structured),
+        "total_count": total_count,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": has_more,
+        "next_offset": next_offset,
+        "techniques": structured,
+        "domain_status": domain_status,
+        "metadata": metadata_ok,
+        "formatted": formatted,
+        "message": (
+            f"Found {total_count} technique(s) across domains ({per_dom_summary}) "
+            f"matching query '{query}'{plat_suffix} (returning {len(structured)} at offset {safe_offset})."
+        ),
+    }
+    if applied_platforms is not None:
+        ok_resp["applied_platforms"] = applied_platforms
+    return _finalize_response(ok_resp)
 
 
 @mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
@@ -2453,6 +2620,17 @@ async def search_techniques(
     offset: PageOffset = 0,
     include_formatted: bool = True,
     detail_level: CrossDomainDetailLevel = "full",
+    platforms: Annotated[
+        Optional[List[str]],
+        Field(
+            default=None,
+            description=(
+                "Optional list of target platforms (case-insensitive, e.g. ['Linux', 'Windows', 'ESXi', 'Containers']). "
+                "When provided, filters matching techniques to those applicable to at least one requested platform "
+                "and includes `applied_platforms` in the response."
+            ),
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """
     Search MITRE ATT&CK techniques by keyword in their name or description.
@@ -2480,7 +2658,7 @@ async def search_techniques(
 
     Examples:
         - search_techniques("PowerShell")
-        - search_techniques("credential dumping")
+        - search_techniques("credential dumping", platforms=["Linux", "Windows"])
         - search_techniques("initial access", domain="enterprise")
         - search_techniques("Command", domain="all", limit=10, include_description=False, include_formatted=False)
         - search_techniques("Screen Capture", domain="all", limit=10, include_description=False, include_formatted=False, detail_level="compact")
@@ -2495,6 +2673,8 @@ async def search_techniques(
         include_formatted: If False, omits the human-readable formatted block to save tokens.
         detail_level: Cross-domain provenance detail level ("full" default, or "compact").
                       Ignored for single-domain calls.
+        platforms: Optional list of platform names to filter matching techniques by
+                   `x_mitre_platforms` (case-insensitive). Omit or pass None for all platforms.
 
     Returns:
         {
@@ -2504,6 +2684,7 @@ async def search_techniques(
           "limit": <limit>,
           "has_more": <bool>,
           "next_offset": <int or null>,
+          "applied_platforms": ["<platform>", ...],  # included when platforms filter is applied
           "techniques": [
             {
               "attack_id": "<TXXXX or TXXXX.YYY>",
@@ -2528,6 +2709,7 @@ async def search_techniques(
             offset=offset,
             include_formatted=include_formatted,
             detail_level=detail_level,
+            platforms=platforms,
         )
 
     attack_data = get_attack_data(domain)
@@ -2535,7 +2717,13 @@ async def search_techniques(
 
     query_lower = (query or "").strip().lower()
     if not query_lower:
-        return {
+        raw_applied = _normalize_technique_platforms(platforms)
+        plat_suffix = (
+            f" (filtered by platforms: {', '.join(raw_applied)})"
+            if raw_applied is not None
+            else ""
+        )
+        empty_resp: Dict[str, Any] = {
             "count": 0,
             "total_count": 0,
             "offset": safe_offset,
@@ -2545,14 +2733,22 @@ async def search_techniques(
             "techniques": [],
             "formatted": "",
             "message": (
-                f"No techniques in domain '{domain}' matched the query '{query}'."
+                f"No techniques in domain '{domain}' matched the query '{query}'{plat_suffix}."
             ),
         }
+        if raw_applied is not None:
+            empty_resp["applied_platforms"] = raw_applied
+        return empty_resp
 
     try:
         all_techniques = attack_data.get_techniques(remove_revoked_deprecated=True)
     except Exception:
         all_techniques = []
+
+    applied_platforms = _normalize_technique_platforms(platforms, all_techniques)
+    platform_set_lower = (
+        {p.lower() for p in applied_platforms} if applied_platforms is not None else None
+    )
 
     matched: List[Any] = []
 
@@ -2561,10 +2757,20 @@ async def search_techniques(
         description = (_stix_get(tech, "description") or "")
 
         if query_lower in name.lower() or query_lower in description.lower():
+            if platform_set_lower is not None and not _technique_matches_platforms(
+                tech, platform_set_lower
+            ):
+                continue
             matched.append(tech)
 
+    plat_suffix = (
+        f" (filtered by platforms: {', '.join(applied_platforms)})"
+        if applied_platforms is not None
+        else ""
+    )
+
     if not matched:
-        return {
+        no_match_resp: Dict[str, Any] = {
             "count": 0,
             "total_count": 0,
             "offset": safe_offset,
@@ -2574,9 +2780,12 @@ async def search_techniques(
             "techniques": [],
             "formatted": "",
             "message": (
-                f"No techniques in domain '{domain}' matched the query '{query}'."
+                f"No techniques in domain '{domain}' matched the query '{query}'{plat_suffix}."
             ),
         }
+        if applied_platforms is not None:
+            no_match_resp["applied_platforms"] = applied_platforms
+        return no_match_resp
 
     matched_sorted = sorted(
         matched,
@@ -2623,7 +2832,7 @@ async def search_techniques(
         else ""
     )
 
-    return {
+    result: Dict[str, Any] = {
         "count": len(structured),
         "total_count": total_count,
         "offset": safe_offset,
@@ -2634,9 +2843,12 @@ async def search_techniques(
         "formatted": formatted,
         "message": (
             f"Found {total_count} technique(s) in domain '{domain}' "
-            f"matching query '{query}' (returning {len(structured)} at offset {safe_offset})."
+            f"matching query '{query}'{plat_suffix} (returning {len(structured)} at offset {safe_offset})."
         ),
     }
+    if applied_platforms is not None:
+        result["applied_platforms"] = applied_platforms
+    return result
 
 @mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_group_by_name(
@@ -7418,13 +7630,25 @@ async def get_all_datacomponents(
     limit: PageLimit = DEFAULT_PAGE_LIMIT,
     offset: PageOffset = 0,
     include_formatted: bool = True,
+    query: Annotated[
+        str,
+        Field(
+            default="",
+            description=(
+                "Optional case-insensitive filter matched against attack_id (DCxxxx), "
+                "name, description, and ATT&CK v20.1 log_sources (name / channel)."
+            ),
+        ),
+    ] = "",
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK data components in a domain.
 
-    Data components are specific aspects of a data source that can be monitored.
-    For example, the "Process" data source has components like
-    "Process Creation", "Process Termination", etc.
+    Data components are specific telemetry aspects that can be monitored
+    (e.g., "Process Creation", "File Modification", "Network Connection Creation").
+    In ATT&CK v20.1, each data component exposes `log_sources` (`x_mitre_log_sources`,
+    listing concrete log source names and channels such as `auditd` or `Sysmon`),
+    while legacy `data_source_*` fields are preserved for backward compatibility.
 
     Args:
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
@@ -7433,6 +7657,8 @@ async def get_all_datacomponents(
         limit: Maximum number of items to return per page (1-200).
         offset: Zero-based starting index for pagination (>= 0).
         include_formatted: If False, omits the human-readable formatted block to save tokens.
+        query: Optional case-insensitive filter across attack_id (DCxxxx), name,
+               description, and log_sources (name / channel).
 
     Returns:
         {
@@ -7449,6 +7675,7 @@ async def get_all_datacomponents(
               "name": "<data component name>",
               "stix_id": "<x-mitre-data-component--UUID>",
               "description": "<text or null>",
+              "log_sources": [{"name": "<log source>", "channel": "<channel>"}, ...],
               "data_source_stix_id": "<x-mitre-data-source--UUID or null>",
               "data_source_name": "<parent data source name or null>",
               "data_source_attack_id": "<data source ATT&CK ID or null>"
@@ -7461,6 +7688,8 @@ async def get_all_datacomponents(
     """
     attack_data = get_attack_data(domain)
     safe_limit, safe_offset = _validate_pagination(limit, offset)
+    raw_query = (query or "").strip()
+    query_lower = raw_query.lower()
 
     try:
         datacomponents = attack_data.get_datacomponents(
@@ -7497,30 +7726,66 @@ async def get_all_datacomponents(
             ),
         }
 
-    dc_with_ids: List[Tuple[str, Any]] = []
+    dc_with_ids: List[Tuple[str, Any, List[Dict[str, str]]]] = []
     for dc in datacomponents:
         sid = _stix_get(dc, "id")
         try:
             aid = attack_data.get_attack_id(sid) if sid else None
         except Exception:
             aid = None
-        dc_with_ids.append((aid or "", dc))
+        aid_str = aid or ""
+        log_sources = _extract_dc_log_sources(dc)
+
+        if query_lower:
+            dc_name = str(_stix_get(dc, "name") or "").lower()
+            dc_desc = str(_stix_get(dc, "description") or "").lower()
+            ls_match = any(
+                query_lower in ls.get("name", "").lower()
+                or query_lower in ls.get("channel", "").lower()
+                for ls in log_sources
+            )
+            if not (
+                query_lower in aid_str.lower()
+                or query_lower in dc_name
+                or query_lower in dc_desc
+                or ls_match
+            ):
+                continue
+
+        dc_with_ids.append((aid_str, dc, log_sources))
+
+    if not dc_with_ids:
+        return {
+            "domain": domain,
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "datacomponents": [],
+            "formatted": "",
+            "message": (
+                f"No data components in domain '{domain}' matched query '{raw_query}' "
+                f"(remove_revoked_deprecated={remove_revoked_deprecated})."
+            ),
+        }
 
     dc_with_ids.sort(
-        key=lambda pair: (
-            pair[0] or "ZZZ",
-            str(_stix_get(pair[1], "name") or ""),
-            str(_stix_get(pair[1], "id") or ""),
+        key=lambda item: (
+            item[0] or "ZZZ",
+            str(_stix_get(item[1], "name") or ""),
+            str(_stix_get(item[1], "id") or ""),
         )
     )
-    page_pairs, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+    page_items, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
         dc_with_ids, limit=limit, offset=offset
     )
 
     structured: List[Dict[str, Any]] = []
     dc_for_format: List[Any] = []
 
-    for dc_aid_key, dc in page_pairs:
+    for dc_aid_key, dc, log_sources in page_items:
         dc_for_format.append(dc)
         name = _stix_get(dc, "name")
         stix_id = _stix_get(dc, "id")
@@ -7551,6 +7816,7 @@ async def get_all_datacomponents(
                 "name": name,
                 "stix_id": stix_id,
                 "description": description,
+                "log_sources": log_sources,
                 "data_source_stix_id": data_source_stix_id,
                 "data_source_name": data_source_name,
                 "data_source_attack_id": data_source_attack_id,
@@ -7567,6 +7833,7 @@ async def get_all_datacomponents(
         else ""
     )
 
+    query_clause = f" matching query '{raw_query}'" if query_lower else ""
     return {
         "domain": domain,
         "count": len(structured),
@@ -7578,7 +7845,7 @@ async def get_all_datacomponents(
         "datacomponents": structured,
         "formatted": formatted,
         "message": (
-            f"Found {total_count} data component(s) in domain '{domain}' "
+            f"Found {total_count} data component(s) in domain '{domain}'{query_clause} "
             f"(remove_revoked_deprecated={remove_revoked_deprecated}, returning {len(structured)} at offset {safe_offset})."
         ),
     }
