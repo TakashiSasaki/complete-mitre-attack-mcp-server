@@ -9,6 +9,7 @@ import sys
 
 from mitreattack import download_stix, release_info
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from mitreattack.stix20 import MitreAttackData
 from pydantic import Field
 
@@ -1179,6 +1180,13 @@ def format_objects(
 
 mcp = FastMCP("mitre-attack-mcp-server")
 
+READ_ONLY_LOCAL_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+
 
 def _resolve_local_version(base_version: str = "0.1.6") -> str:
     """Append +local.<short-sha>[.dirty] SemVer build metadata from git."""
@@ -1224,7 +1232,7 @@ async def mcp_head_route(request):
     return Response(status_code=200, headers={"Content-Type": "application/json"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_data_stats() -> Dict[str, Any]:
     """
     Return statistics about downloaded MITRE ATT&CK STIX data.
@@ -1235,7 +1243,7 @@ async def get_data_stats() -> Dict[str, Any]:
     """
     return _compute_data_stats()
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_technique_by_id(
     technique_id: str,
     domain: str = "enterprise",
@@ -1343,7 +1351,7 @@ async def get_technique_by_id(
         "message": msg,
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_object_by_attack_id(
     attack_id: str,
     stix_type: str,
@@ -1430,7 +1438,7 @@ async def get_object_by_attack_id(
         "message": f"Object found for ATT&CK ID '{resolved_id}' in domain '{domain}'.",
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_object_by_stix_id(
     stix_id: str,
     domain: str = "enterprise",
@@ -1518,7 +1526,7 @@ async def get_object_by_stix_id(
         "message": f"Object found for STIX ID '{stix_id}' in domain '{domain}'.",
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_objects_by_name(
     name: str,
     stix_type: str,
@@ -1642,7 +1650,7 @@ async def get_objects_by_name(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_objects_by_content(
     content: str,
     object_type: str = "all",
@@ -1882,7 +1890,7 @@ async def get_objects_by_content(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_techniques_by_tactic(
     tactic: str,
     domain: str = "enterprise",
@@ -2427,7 +2435,7 @@ def _search_techniques_all_domains(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def search_techniques(
     query: str,
     domain: Annotated[
@@ -2630,7 +2638,7 @@ async def search_techniques(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_group_by_name(
     group_name: str,
     domain: str = "enterprise",
@@ -2752,7 +2760,7 @@ async def get_group_by_name(
         "message": msg,
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_stix_type(
     stix_id: str,
     domain: str = "enterprise",
@@ -2812,7 +2820,7 @@ async def get_stix_type(
         "message": f"STIX object type for '{stix_id}' is '{actual_type}'.",
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def search_groups(
     query: str = "",
     domain: str = "enterprise",
@@ -2959,7 +2967,7 @@ async def search_groups(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_group_techniques(
     group_name: str,
     domain: str = "enterprise",
@@ -3190,7 +3198,7 @@ async def get_group_techniques(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_software(
     domain: str = "enterprise",
     include_description: bool = False,
@@ -3320,7 +3328,7 @@ async def get_software(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def search_software(
     query: str,
     domain: str = "enterprise",
@@ -3490,7 +3498,7 @@ async def search_software(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_attack_id(
     stix_id: str,
     domain: str = "enterprise",
@@ -3549,7 +3557,7 @@ async def get_attack_id(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_name(
     stix_id: str,
     domain: str = "enterprise",
@@ -3607,7 +3615,7 @@ async def get_name(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_technique_tactics(
     technique_id: str,
     domain: str = "enterprise",
@@ -3718,7 +3726,7 @@ async def get_technique_tactics(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_stats(
     domain: str = "enterprise",
 ) -> Dict[str, Any]:
@@ -3778,7 +3786,7 @@ async def get_stats(
     # Threat Actor Group functions
 #####################################################################
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_groups_by_alias(
     alias: str,
     domain: str = "enterprise",
@@ -3899,7 +3907,7 @@ async def get_groups_by_alias(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_techniques_used_by_group(
     group_stix_id: str,
     domain: str = "enterprise",
@@ -4118,7 +4126,7 @@ async def get_techniques_used_by_group(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_software_used_by_group(
     group_stix_id: str,
     domain: str = "enterprise",
@@ -4327,7 +4335,7 @@ async def get_software_used_by_group(
 # Campaign lookup
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_campaigns_attributed_to_group(
     group_stix_id: str,
     domain: str = "enterprise",
@@ -4476,7 +4484,7 @@ async def get_campaigns_attributed_to_group(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_campaigns_by_alias(
     alias: str,
     domain: str = "enterprise",
@@ -4591,7 +4599,7 @@ async def get_campaigns_by_alias(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_techniques_used_by_group_software(
     group_stix_id: str,
     domain: str = "enterprise",
@@ -4938,7 +4946,7 @@ async def get_techniques_used_by_group_software(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_groups_using_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
@@ -5140,7 +5148,7 @@ async def get_groups_using_technique(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_groups_using_software(
     software_stix_id: str,
     domain: str = "enterprise",
@@ -5345,7 +5353,7 @@ async def get_groups_using_software(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_groups_attributing_to_campaign(
     campaign_stix_id: str,
     domain: str = "enterprise",
@@ -5514,7 +5522,7 @@ async def get_groups_attributing_to_campaign(
 #####################################################################
     # Software functions
 #####################################################################
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_software_by_alias(
     alias: str,
     domain: str = "enterprise",
@@ -5643,7 +5651,7 @@ async def get_software_by_alias(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_software_using_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
@@ -5848,7 +5856,7 @@ async def get_software_using_technique(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_techniques_used_by_software(
     software_stix_id: str,
     domain: str = "enterprise",
@@ -6055,7 +6063,7 @@ async def get_techniques_used_by_software(
     # "Get All" functions for MITRE ATT&CK objects
 #####################################################################
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_techniques(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
@@ -6189,7 +6197,7 @@ async def get_all_techniques(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_subtechniques(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
@@ -6364,7 +6372,7 @@ async def get_all_subtechniques(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_parent_techniques(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
@@ -6511,7 +6519,7 @@ async def get_all_parent_techniques(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_groups(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
@@ -6650,7 +6658,7 @@ async def get_all_groups(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_software(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
@@ -6795,7 +6803,7 @@ async def get_all_software(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_mitigations(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
@@ -6934,7 +6942,7 @@ async def get_all_mitigations(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_tactics(
     domain: str = "enterprise",
     include_description: bool = True,
@@ -7035,7 +7043,7 @@ async def get_all_tactics(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_matrices(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
@@ -7146,7 +7154,7 @@ async def get_all_matrices(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_campaigns(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
@@ -7288,7 +7296,7 @@ async def get_all_campaigns(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_datasources(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
@@ -7402,7 +7410,7 @@ async def get_all_datasources(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_datacomponents(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
@@ -7580,7 +7588,7 @@ async def get_all_datacomponents(
 # Technique → ICS Assets targeted (ICS domain only)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_all_assets(
     domain: str = "ics",
     remove_revoked_deprecated: bool = True,
@@ -7696,7 +7704,7 @@ async def get_all_assets(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_assets_targeted_by_technique(
     technique_stix_id: str,
     domain: str = "ics",
@@ -7835,7 +7843,7 @@ async def get_assets_targeted_by_technique(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_techniques_targeting_asset(
     asset_stix_id: str,
     domain: str = "ics",
@@ -7989,7 +7997,7 @@ async def get_techniques_targeting_asset(
     # Campaign functions
 #####################################################################
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_campaigns_using_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
@@ -8190,7 +8198,7 @@ async def get_campaigns_using_technique(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_techniques_used_by_campaign(
     campaign_stix_id: str,
     domain: str = "enterprise",
@@ -8391,7 +8399,7 @@ async def get_techniques_used_by_campaign(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_campaigns_using_software(
     software_stix_id: str,
     domain: str = "enterprise",
@@ -8595,7 +8603,7 @@ async def get_campaigns_using_software(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_software_used_by_campaign(
     campaign_stix_id: str,
     domain: str = "enterprise",
@@ -8766,7 +8774,7 @@ async def get_software_used_by_campaign(
     # Technique functions
 #####################################################################
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_techniques_by_platform(
     platform: str,
     domain: str = "enterprise",
@@ -8967,7 +8975,7 @@ async def get_techniques_by_platform(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_parent_technique_of_subtechnique(
     technique_stix_id: str,
     domain: str = "enterprise",
@@ -9088,7 +9096,7 @@ async def get_parent_technique_of_subtechnique(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_subtechniques_of_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
@@ -9227,7 +9235,7 @@ async def get_subtechniques_of_technique(
 # Mitigation → Technique mapping
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_techniques_mitigated_by_mitigation(
     mitigation_stix_id: str,
     domain: str = "enterprise",
@@ -9906,7 +9914,7 @@ def _get_mitigations_mitigating_technique_batch(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_mitigations_mitigating_technique(
     technique_stix_id: str = "",
     domain: str = "enterprise",
@@ -10069,7 +10077,7 @@ async def get_mitigations_mitigating_technique(
 # ---------------------------------------------------------------------------
 # Technique → Data components (detection)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 def get_datacomponents_detecting_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
@@ -10376,7 +10384,7 @@ def get_datacomponents_detecting_technique(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_techniques_detected_by_datacomponent(
     datacomponent_stix_id: str,
     domain: str = "enterprise",
@@ -10591,7 +10599,7 @@ async def get_techniques_detected_by_datacomponent(
 # Technique → Tactic → Procedure Examples (real-world usage)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_procedure_examples_by_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
@@ -10772,7 +10780,7 @@ async def get_procedure_examples_by_technique(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_procedure_examples_by_tactic(
     tactic: str,
     domain: str = "enterprise",
@@ -11045,7 +11053,7 @@ async def get_procedure_examples_by_tactic(
 # Generic STIX object browser
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_objects_by_type(
     stix_type: str,
     domain: str = "enterprise",
@@ -11203,7 +11211,7 @@ async def get_objects_by_type(
         ),
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_tactics_by_matrix(
     matrix_stix_id: str,
     domain: str = "enterprise",
@@ -11319,7 +11327,7 @@ async def get_tactics_by_matrix(
         "message": f"Found {len(results)} tactic(s) in matrix '{matrix_stix_id}'.",
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_tactics_by_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
@@ -11425,7 +11433,7 @@ async def get_tactics_by_technique(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_objects_created_after(
     timestamp: str,
     domain: str = "enterprise",
@@ -11565,7 +11573,7 @@ async def get_objects_created_after(
         "message": f"Showing {len(results)} of {total_count} objects{type_clause} created after {timestamp} (offset={safe_offset}).",
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_objects_modified_after(
     timestamp: str,
     domain: str = "enterprise",
@@ -11707,7 +11715,7 @@ async def get_objects_modified_after(
         "message": f"Showing {len(results)} of {total_count} objects{type_clause} modified after {timestamp} (offset={safe_offset}).",
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_revoked_techniques(
     domain: str = "enterprise",
     include_description: bool = True,
@@ -11831,7 +11839,7 @@ async def get_revoked_techniques(
         "message": f"Found {total_count} revoked techniques in '{domain}' (returning {len(output_items)} at offset {safe_offset}).",
     }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def generate_layer(
     attack_id: str = "",
     score: int = 1,
@@ -12149,7 +12157,7 @@ async def generate_layer(
             "message": f"Failed to generate layer: {e}",
         }
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
     """
     Return a standard ATT&CK Navigator layer metadata template.
@@ -13049,7 +13057,7 @@ def _get_detection_strategies_batch(
     return full_resp
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_detection_strategies_for_technique(
     technique_stix_id: str = "",
     domain: str = "enterprise",
@@ -13214,7 +13222,7 @@ async def get_detection_strategies_for_technique(
     return single_resp
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_LOCAL_ANNOTATIONS)
 async def get_analytics(
     domain: str = "enterprise",
     query: str = "",
