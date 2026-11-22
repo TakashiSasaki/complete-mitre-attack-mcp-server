@@ -946,6 +946,39 @@ def _suggest_attack_platforms(
     return suggested
 
 
+def _extract_available_platforms(objects: List[Any]) -> List[str]:
+    """Extract sorted unique canonical platform names from STIX objects with x_mitre_platforms."""
+    known: Dict[str, str] = {}
+    for obj in objects or []:
+        for p in (_stix_get(obj, "x_mitre_platforms") or []):
+            if p and str(p).strip():
+                ps = str(p).strip()
+                known[ps.lower()] = ps
+    return sorted(set(known.values()))
+
+
+def _suggest_attack_platforms_for_list(
+    raw_platforms: Optional[List[str]],
+    available_platforms: List[str],
+) -> List[str]:
+    """Collect deduplicated ATT&CK platform suggestions for a list of requested platform labels."""
+    if not raw_platforms or not available_platforms:
+        return []
+    avail_lower = {p.lower() for p in available_platforms}
+    suggested: List[str] = []
+    seen: set[str] = set()
+    for raw_plat in raw_platforms:
+        if not raw_plat or not str(raw_plat).strip():
+            continue
+        if str(raw_plat).strip().lower() in avail_lower:
+            continue
+        for cand in _suggest_attack_platforms(str(raw_plat), available_platforms):
+            if cand not in seen:
+                seen.add(cand)
+                suggested.append(cand)
+    return suggested
+
+
 def _normalize_technique_platforms(
     platforms: Optional[List[str]],
     techniques: Optional[List[Any]] = None,
@@ -2210,7 +2243,20 @@ async def get_techniques_by_tactic(
             t for t in techniques if _technique_matches_platforms(t, platform_set_lower)
         ]
         if not techniques:
-            return {
+            try:
+                domain_techniques = attack_data.get_techniques(remove_revoked_deprecated=True) or []
+            except Exception:
+                domain_techniques = []
+            available_platforms = _extract_available_platforms(domain_techniques)
+            suggested_platforms = _suggest_attack_platforms_for_list(
+                applied_platforms, available_platforms
+            )
+            hint_clause = (
+                f" Suggested ATT&CK platform(s): {', '.join(suggested_platforms)}."
+                if suggested_platforms
+                else ""
+            )
+            no_plat_resp: Dict[str, Any] = {
                 "count": 0,
                 "total_count": 0,
                 "offset": safe_offset,
@@ -2222,9 +2268,12 @@ async def get_techniques_by_tactic(
                 "formatted": "",
                 "message": (
                     f"No techniques found for tactic '{canonical_tactic}' in domain '{domain}' "
-                    f"(filtered by platforms: {', '.join(applied_platforms)})."
+                    f"(filtered by platforms: {', '.join(applied_platforms)}).{hint_clause}"
                 ),
             }
+            if suggested_platforms:
+                no_plat_resp["suggested_platforms"] = suggested_platforms
+            return no_plat_resp
 
     techniques_sorted = sorted(
         techniques,
@@ -2635,6 +2684,17 @@ def _search_techniques_all_domains(
     )
 
     if not matched_records:
+        suggested_platforms: List[str] = []
+        if applied_platforms is not None:
+            available_platforms = _extract_available_platforms(all_loaded_techniques)
+            suggested_platforms = _suggest_attack_platforms_for_list(
+                applied_platforms, available_platforms
+            )
+        hint_clause = (
+            f" Suggested ATT&CK platform(s): {', '.join(suggested_platforms)}."
+            if suggested_platforms
+            else ""
+        )
         no_match_resp: Dict[str, Any] = {
             "domain": "all",
             "domains_searched": list(DOMAINS),
@@ -2649,11 +2709,13 @@ def _search_techniques_all_domains(
             "metadata": metadata_ok,
             "formatted": "",
             "message": (
-                f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'{plat_suffix}."
+                f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'{plat_suffix}.{hint_clause}"
             ),
         }
         if applied_platforms is not None:
             no_match_resp["applied_platforms"] = applied_platforms
+        if suggested_platforms:
+            no_match_resp["suggested_platforms"] = suggested_platforms
         return _finalize_response(no_match_resp)
 
     # Deterministic global sort: name ascending, domain rank (enterprise, mobile, ics), attack_id, stix_id
@@ -2889,6 +2951,17 @@ async def search_techniques(
     )
 
     if not matched:
+        suggested_platforms: List[str] = []
+        if applied_platforms is not None:
+            available_platforms = _extract_available_platforms(all_techniques)
+            suggested_platforms = _suggest_attack_platforms_for_list(
+                applied_platforms, available_platforms
+            )
+        hint_clause = (
+            f" Suggested ATT&CK platform(s): {', '.join(suggested_platforms)}."
+            if suggested_platforms
+            else ""
+        )
         no_match_resp: Dict[str, Any] = {
             "count": 0,
             "total_count": 0,
@@ -2899,11 +2972,13 @@ async def search_techniques(
             "techniques": [],
             "formatted": "",
             "message": (
-                f"No techniques in domain '{domain}' matched the query '{query}'{plat_suffix}."
+                f"No techniques in domain '{domain}' matched the query '{query}'{plat_suffix}.{hint_clause}"
             ),
         }
         if applied_platforms is not None:
             no_match_resp["applied_platforms"] = applied_platforms
+        if suggested_platforms:
+            no_match_resp["suggested_platforms"] = suggested_platforms
         return no_match_resp
 
     matched_sorted = sorted(
@@ -11054,12 +11129,24 @@ async def get_procedure_examples_by_technique(
     limit: PageLimit = DEFAULT_PAGE_LIMIT,
     offset: PageOffset = 0,
     include_formatted: bool = True,
+    query: Annotated[
+        str,
+        Field(
+            default="",
+            description=(
+                "Optional case-insensitive substring filter across procedure description "
+                "and source name, ATT&CK ID, or STIX ID (e.g. 'CVE-', 'QNAP', 'SSH', 'G0016')."
+            ),
+        ),
+    ] = "",
 ) -> Dict[str, Any]:
     """
     Get procedure examples showing how threat groups, software, or campaigns used a specific technique.
 
     Procedure examples describe real incident behavior tied to this technique.
     Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1190").
+    Results are deterministically sorted by source ATT&CK ID (then name, then STIX ID)
+    and support pagination and optional case-insensitive substring filtering via `query`.
 
     Args:
         technique_stix_id: STIX UUID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
@@ -11068,6 +11155,8 @@ async def get_procedure_examples_by_technique(
         limit: Maximum number of items to return per page (1-200).
         offset: Zero-based starting index for pagination (>= 0).
         include_formatted: If False, omits the human-readable formatted block to save tokens.
+        query: Optional case-insensitive substring filter matching procedure description
+               and source name/ID (e.g., "CVE-", "QNAP", "SSH").
 
     Returns:
         {
@@ -11090,6 +11179,8 @@ async def get_procedure_examples_by_technique(
     """
     attack_data = get_attack_data(domain)
     safe_limit, safe_offset = _validate_pagination(limit, offset)
+    query_clean = (query or "").strip()
+    query_lower = query_clean.lower()
 
     resolved_id, tech_obj, err = _resolve_stix_object(
         technique_stix_id, domain=domain, expected_stix_type="attack-pattern"
@@ -11129,6 +11220,8 @@ async def get_procedure_examples_by_technique(
     except Exception:
         examples = []
 
+    query_suffix = f" matching query '{query_clean}'" if query_clean else ""
+
     if not examples:
         return {
             "found": True,
@@ -11143,38 +11236,101 @@ async def get_procedure_examples_by_technique(
             "formatted": "",
             "message": (
                 f"No procedure examples found for technique '{tech_attack_id}' "
-                f"in domain '{domain}'."
+                f"in domain '{domain}'{query_suffix}."
             ),
         }
 
-    examples_sorted = sorted(
-        examples,
-        key=lambda r: (
-            str(_stix_get(r, "source_ref") or ""),
-            str(_stix_get(r, "id") or ""),
-        ),
+    # Resolve source metadata before filtering and deterministic sorting by source attack_id
+    source_cache: Dict[str, Tuple[Optional[str], Optional[str], Optional[str]]] = {}
+    resolved_rows: List[Dict[str, Any]] = []
+    for rel in examples:
+        rel_id = _stix_get(rel, "id")
+        raw_desc = _stix_get(rel, "description")
+        source_stix_id = _stix_get(rel, "source_ref")
+
+        if isinstance(source_stix_id, str) and source_stix_id in source_cache:
+            src_attack_id, src_name, src_type = source_cache[source_stix_id]
+        else:
+            src_attack_id = None
+            src_name = None
+            src_type = (
+                source_stix_id.split("--")[0]
+                if isinstance(source_stix_id, str) and "--" in source_stix_id
+                else None
+            )
+            try:
+                src_obj = attack_data.get_object_by_stix_id(source_stix_id)
+                if src_obj:
+                    src_name = _stix_get(src_obj, "name")
+                    src_type = _stix_get(src_obj, "type") or src_type
+                    src_attack_id = attack_data.get_attack_id(source_stix_id)
+            except Exception:
+                pass
+            if isinstance(source_stix_id, str):
+                source_cache[source_stix_id] = (src_attack_id, src_name, src_type)
+
+        if query_lower:
+            haystack = (
+                f"{raw_desc or ''}\n"
+                f"{src_name or ''}\n"
+                f"{src_attack_id or ''}\n"
+                f"{source_stix_id or ''}"
+            ).lower()
+            if query_lower not in haystack:
+                continue
+
+        resolved_rows.append(
+            {
+                "rel_id": rel_id,
+                "raw_desc": raw_desc,
+                "source_stix_id": source_stix_id,
+                "src_attack_id": src_attack_id,
+                "src_name": src_name,
+                "src_type": src_type,
+            }
+        )
+
+    if not resolved_rows:
+        return {
+            "found": True,
+            "technique": technique_info,
+            "count": 0,
+            "total_count": 0,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": False,
+            "next_offset": None,
+            "examples": [],
+            "formatted": "",
+            "message": (
+                f"No procedure examples found for technique '{tech_attack_id}' "
+                f"in domain '{domain}'{query_suffix}."
+            ),
+        }
+
+    resolved_rows.sort(
+        key=lambda row: (
+            _attack_id_sort_key(
+                row["src_attack_id"],
+                row["src_name"],
+                row["source_stix_id"],
+            ),
+            str(row["rel_id"] or ""),
+        )
     )
-    page_examples, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
-        examples_sorted, limit=limit, offset=offset
+
+    page_rows, total_count, safe_offset, safe_limit, has_more, next_offset = _paginate_items(
+        resolved_rows, limit=limit, offset=offset
     )
 
     example_entries = []
-    for rel in page_examples:
-        rel_id = _stix_get(rel, "id")
-        desc = _stix_get(rel, "description") if include_description else None
-        source_stix_id = _stix_get(rel, "source_ref")
-
-        src_attack_id = None
-        src_name = None
-        src_type = source_stix_id.split("--")[0] if isinstance(source_stix_id, str) and "--" in source_stix_id else None
-        try:
-            src_obj = attack_data.get_object_by_stix_id(source_stix_id)
-            if src_obj:
-                src_name = _stix_get(src_obj, "name")
-                src_type = _stix_get(src_obj, "type") or src_type
-                src_attack_id = attack_data.get_attack_id(source_stix_id)
-        except Exception:
-            pass
+    for row in page_rows:
+        rel_id = row["rel_id"]
+        desc = row["raw_desc"] if include_description else None
+        source_stix_id = row["source_stix_id"]
+        src_attack_id = row["src_attack_id"]
+        src_name = row["src_name"]
+        src_type = row["src_type"]
 
         is_group = src_type == "intrusion-set"
         example_entries.append(
@@ -11221,7 +11377,7 @@ async def get_procedure_examples_by_technique(
         "formatted": formatted,
         "message": (
             f"Found {total_count} procedure examples for "
-            f"technique '{tech_attack_id}' ({tech_name}) "
+            f"technique '{tech_attack_id}' ({tech_name}){query_suffix} "
             f"(returning {len(example_entries)} at offset {safe_offset})."
         ),
     }
@@ -12736,6 +12892,7 @@ def _build_detection_batch_metadata(
     detail_level: str = "compact",
     include_log_sources: bool = False,
     applied_platforms: Optional[List[str]] = None,
+    suggested_platforms: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build version, source provenance, and coverage caveat metadata for batch detection responses."""
     if domain in DOMAINS:
@@ -12761,6 +12918,8 @@ def _build_detection_batch_metadata(
     }
     if applied_platforms is not None:
         meta["applied_platforms"] = applied_platforms
+    if suggested_platforms:
+        meta["suggested_platforms"] = suggested_platforms
     if detail_level == "full":
         meta["stix_spec_version"] = prov.get("stix_spec_version", "2.1")
         meta["source_repository"] = prov.get("source_repository", _SOURCE_REPOSITORY_URL)
@@ -13328,6 +13487,18 @@ def _get_detection_strategies_batch(
 
     any_resolved = (found_count + no_det_count) > 0
 
+    batch_suggested_platforms: List[str] = []
+    if applied_platforms is not None and len(an_out) == 0:
+        available_an_platforms = _extract_available_platforms(list(an_by_id.values()))
+        batch_suggested_platforms = _suggest_attack_platforms_for_list(
+            applied_platforms, available_an_platforms
+        )
+    batch_hint_clause = (
+        f" Suggested ATT&CK platform(s): {', '.join(batch_suggested_platforms)}."
+        if batch_suggested_platforms
+        else ""
+    )
+
     if level == "compact":
         compact_techniques: List[Dict[str, Any]] = []
         for r in techniques_out:
@@ -13441,15 +13612,18 @@ def _get_detection_strategies_batch(
                 detail_level="compact",
                 include_log_sources=eff_log_sources,
                 applied_platforms=applied_platforms,
+                suggested_platforms=batch_suggested_platforms or None,
             ),
             "message": (
                 f"Resolved {found_count + no_det_count} of {len(techniques_out)} technique(s) "
                 f"in domain '{dom}': {len(ds_out)} unique detection strategy(ies), "
-                f"{len(an_out)} analytic(s), {len(dc_out)} data component(s){plat_suffix}."
+                f"{len(an_out)} analytic(s), {len(dc_out)} data component(s){plat_suffix}.{batch_hint_clause}"
             ),
         }
         if applied_platforms is not None:
             compact_resp["applied_platforms"] = applied_platforms
+        if batch_suggested_platforms:
+            compact_resp["suggested_platforms"] = batch_suggested_platforms
         return compact_resp
 
     plat_suffix = (
@@ -13492,15 +13666,18 @@ def _get_detection_strategies_batch(
             detail_level="full",
             include_log_sources=True,
             applied_platforms=applied_platforms,
+            suggested_platforms=batch_suggested_platforms or None,
         ),
         "message": (
             f"Resolved {found_count + no_det_count} of {len(techniques_out)} technique(s) "
             f"in domain '{dom}': {len(ds_out)} unique detection strategy(ies), "
-            f"{len(an_out)} analytic(s), {len(dc_out)} data component(s){plat_suffix}."
+            f"{len(an_out)} analytic(s), {len(dc_out)} data component(s){plat_suffix}.{batch_hint_clause}"
         ),
     }
     if applied_platforms is not None:
         full_resp["applied_platforms"] = applied_platforms
+    if batch_suggested_platforms:
+        full_resp["suggested_platforms"] = batch_suggested_platforms
     return full_resp
 
 
@@ -13653,6 +13830,19 @@ async def get_detection_strategies_for_technique(
         if applied_platforms is not None
         else ""
     )
+    single_suggested_platforms: List[str] = []
+    if applied_platforms is not None and not strategies:
+        available_an_platforms = _extract_available_platforms(
+            list(v20_idx.get("an_by_id", {}).values())
+        )
+        single_suggested_platforms = _suggest_attack_platforms_for_list(
+            applied_platforms, available_an_platforms
+        )
+    single_hint_clause = (
+        f" Suggested ATT&CK platform(s): {', '.join(single_suggested_platforms)}."
+        if single_suggested_platforms
+        else ""
+    )
     single_resp: Dict[str, Any] = {
         "found": True,
         "technique_stix_id": technique_stix_id,
@@ -13661,11 +13851,13 @@ async def get_detection_strategies_for_technique(
         "detection_strategies": strategies,
         "message": (
             f"Found {len(strategies)} detection strategy(ies) for "
-            f"'{technique_stix_id}' in domain '{domain}'{plat_suffix}."
+            f"'{technique_stix_id}' in domain '{domain}'{plat_suffix}.{single_hint_clause}"
         ),
     }
     if applied_platforms is not None:
         single_resp["applied_platforms"] = applied_platforms
+    if single_suggested_platforms:
+        single_resp["suggested_platforms"] = single_suggested_platforms
     return single_resp
 
 
