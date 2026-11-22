@@ -265,17 +265,27 @@ class TestGroupSoftwareProvenanceAndRegressions(unittest.TestCase):
 
     def test_p2_group_software_technique_provenance(self) -> None:
         group_id = "intrusion-set--899ce53f-13a0-479b-a0e4-67d46e241542"  # APT29
-        res = asyncio.run(
-            srv.get_techniques_used_by_group_software(
-                group_stix_id=group_id,
-                domain="enterprise",
-                include_description=False,
+        all_techniques = []
+        offset = 0
+        while True:
+            res = asyncio.run(
+                srv.get_techniques_used_by_group_software(
+                    group_stix_id=group_id,
+                    domain="enterprise",
+                    include_description=False,
+                    limit=100,
+                    offset=offset,
+                )
             )
-        )
-        self.assertEqual(res["count"], 205)
+            self.assertEqual(res["total_count"], 205)
+            all_techniques.extend(res["techniques"])
+            if not res["has_more"]:
+                break
+            offset = res["next_offset"]
+        self.assertEqual(len(all_techniques), 205)
         direct_paths_count = 0
         indirect_paths_count = 0
-        for tech in res["techniques"]:
+        for tech in all_techniques:
             self.assertTrue(tech["relationships"], f"Empty relationships for {tech['stix_id']}")
             self.assertTrue(tech["provenance_paths"], f"Empty provenance_paths for {tech['stix_id']}")
             for rel in tech["relationships"]:
@@ -315,21 +325,28 @@ class TestGroupSoftwareProvenanceAndRegressions(unittest.TestCase):
         self.assertGreater(indirect_paths_count, 0)
 
         # Cross-verify a returned provenance path against both direct relationship APIs
-        sample_tech = res["techniques"][0]
-        sample_path = sample_tech["provenance_paths"][0]
+        sample_tech = next(
+            t for t in all_techniques
+            if any(p.get("path_type") == "direct" for p in t["provenance_paths"])
+        )
+        sample_path = next(p for p in sample_tech["provenance_paths"] if p.get("path_type") == "direct")
         sw_id = sample_path["software"]["stix_id"]
         g2s_id = sample_path["group_uses_software"]["stix_id"]
         s2t_id = sample_path["software_uses_technique"]["stix_id"]
 
         sw_used_by_group = asyncio.run(
-            srv.get_software_used_by_group(group_stix_id=group_id, domain="enterprise", include_description=False)
+            srv.get_software_used_by_group(
+                group_stix_id=group_id, domain="enterprise", include_description=False, limit=200
+            )
         )
         sw_match = [s for s in sw_used_by_group["software"] if s["stix_id"] == sw_id]
         self.assertTrue(sw_match, f"Software {sw_id} not found in get_software_used_by_group")
         self.assertIn(g2s_id, [r["stix_id"] for r in sw_match[0]["relationships"]])
 
         techs_by_sw = asyncio.run(
-            srv.get_techniques_used_by_software(software_stix_id=sw_id, domain="enterprise", include_description=False)
+            srv.get_techniques_used_by_software(
+                software_stix_id=sw_id, domain="enterprise", include_description=False, limit=200
+            )
         )
         tech_match = [t for t in techs_by_sw["techniques"] if t["stix_id"] == sample_tech["stix_id"]]
         self.assertTrue(tech_match, f"Technique {sample_tech['stix_id']} not found in get_techniques_used_by_software")

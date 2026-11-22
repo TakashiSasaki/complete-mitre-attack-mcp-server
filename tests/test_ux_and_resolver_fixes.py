@@ -57,7 +57,10 @@ class TestUnifiedIdentifierResolution(unittest.TestCase):
         # 5. get_techniques_used_by_group_software
         res = asyncio.run(srv.get_techniques_used_by_group_software("G0016", domain="enterprise", include_description=False, include_formatted=False))
         self.assertTrue(res["found"])
-        self.assertEqual(res["count"], 205)
+        self.assertEqual(res["total_count"], 205)
+        self.assertEqual(res["count"], srv.DEFAULT_PAGE_LIMIT)
+        self.assertTrue(res["has_more"])
+        self.assertEqual(res["next_offset"], srv.DEFAULT_PAGE_LIMIT)
 
         # 6. get_software_used_by_group
         res = asyncio.run(srv.get_software_used_by_group("G0016", domain="enterprise", include_description=False, include_formatted=False))
