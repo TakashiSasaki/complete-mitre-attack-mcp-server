@@ -303,7 +303,7 @@ a STIX ID rather than an ATT&CK ID.
 | Tool | Description |
 |---|---|
 | `get_technique_by_id` | Get a technique by ATT&CK ID, for example T1055 |
-| `search_techniques` | Search techniques by name or description (`domain='enterprise'`, `'mobile'`, `'ics'`, or `'all'` for cross-domain retrieval with release provenance) |
+| `search_techniques` | Search techniques by name or description (`domain='enterprise'`, `'mobile'`, `'ics'`, or `'all'` for cross-domain retrieval with release provenance and optional `detail_level='compact'`/`'full'`) |
 | `get_all_techniques` | Retrieve all techniques |
 | `get_all_parent_techniques` | Parent techniques only |
 | `get_all_subtechniques` | All sub-techniques |

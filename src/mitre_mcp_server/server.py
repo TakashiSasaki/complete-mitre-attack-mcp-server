@@ -87,6 +87,36 @@ BatchDetailLevel = Annotated[
     ),
 ]
 
+CrossDomainDetailLevel = Annotated[
+    Literal["compact", "full"],
+    Field(
+        default="full",
+        description=(
+            "Cross-domain (`domain='all'`) response detail level: 'full' (default; preserves "
+            "legacy per-domain provenance in `domain_status` and `limitations` in `metadata`) "
+            "or 'compact' (deduplicates shared release/provenance into `metadata` with "
+            "`source_url_template` while preserving per-domain status, match counts, failure "
+            "differentiation, and all technique records). Ignored for single-domain calls."
+        ),
+    ),
+]
+
+
+def _validate_cross_domain_detail_level(detail_level: str) -> str:
+    """Validate and normalize cross-domain search detail_level to 'compact' or 'full'."""
+    if not isinstance(detail_level, str):
+        raise ValueError(
+            f"Invalid detail_level {detail_level!r}: "
+            f"must be one of {', '.join(_VALID_BATCH_DETAIL_LEVELS)}."
+        )
+    normalized = detail_level.strip().lower()
+    if normalized not in _VALID_BATCH_DETAIL_LEVELS:
+        raise ValueError(
+            f"Invalid detail_level {detail_level!r}: "
+            f"must be one of {', '.join(_VALID_BATCH_DETAIL_LEVELS)}."
+        )
+    return normalized
+
 
 def _validate_attribution_filter(attribution_filter: str) -> str:
     """Validate and normalize attribution_filter to 'all', 'direct', or 'campaign'."""
@@ -2042,15 +2072,62 @@ def _format_cross_domain_techniques(
     return "\n---\n".join(blocks)
 
 
+def _compact_cross_domain_provenance(
+    domain_status: Dict[str, Dict[str, Any]],
+    metadata: Dict[str, Any],
+    ver_str: str,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Build compact `domain_status` and `metadata` by hoisting shared provenance and preserving failure differentiation."""
+    compact_ds: Dict[str, Dict[str, Any]] = {}
+    for dom, ds in domain_status.items():
+        if ds.get("status") == "OK" and ds.get("available") is True:
+            compact_ds[dom] = {
+                "status": "OK",
+                "available": True,
+                "match_count": ds.get("match_count"),
+            }
+        else:
+            compact_ds[dom] = {
+                "status": ds.get("status", "UNAVAILABLE"),
+                "available": False,
+                "match_count": ds.get("match_count"),
+                "loaded_version": ds.get("loaded_version"),
+                "source_url": ds.get("source_url"),
+                "freshness_status": ds.get("freshness_status"),
+                "error": ds.get("error"),
+            }
+
+    compact_meta: Dict[str, Any] = {
+        "detail_level": "compact",
+        "attack_version": metadata["attack_version"],
+        "stix_spec_version": metadata["stix_spec_version"],
+        "source_repository": metadata["source_repository"],
+        "source_index_url": metadata["source_index_url"],
+        "source_url_template": (
+            f"https://raw.githubusercontent.com/mitre-attack/attack-stix-data/"
+            f"master/{{domain}}-attack/{{domain}}-attack-{ver_str}.json"
+        ),
+        "source_release_date": metadata["source_release_date"],
+        "source_release_date_known": metadata["source_release_date_known"],
+        "freshness_status": metadata["freshness_status"],
+        "complete": metadata["complete"],
+        "partial": metadata["partial"],
+        "unavailable_domains": list(metadata["unavailable_domains"]),
+    }
+    return compact_ds, compact_meta
+
+
 def _search_techniques_all_domains(
     query: str,
     include_description: bool,
     limit: int,
     offset: int,
     include_formatted: bool,
+    detail_level: str = "full",
 ) -> Dict[str, Any]:
     """Perform cross-domain search across enterprise, mobile, and ics local STIX bundles."""
     safe_limit, safe_offset = _validate_pagination(limit, offset)
+    level = _validate_cross_domain_detail_level(detail_level)
     query_lower = (query or "").strip().lower()
 
     domain_status: Dict[str, Dict[str, Any]] = {}
@@ -2117,6 +2194,24 @@ def _search_techniques_all_domains(
         "Upstream currency beyond the loaded release is unknown without an external check against attack-stix-data.",
     ]
 
+    def _finalize_response(resp: Dict[str, Any]) -> Dict[str, Any]:
+        if level != "compact":
+            return resp
+        c_ds, c_meta = _compact_cross_domain_provenance(
+            resp["domain_status"], resp["metadata"], ver_str
+        )
+        out: Dict[str, Any] = {}
+        for k, v in resp.items():
+            if k == "domain_status":
+                out[k] = c_ds
+            elif k == "metadata":
+                out[k] = c_meta
+            else:
+                out[k] = v
+            if k == "domains_searched":
+                out["detail_level"] = "compact"
+        return out
+
     if unavailable_domains:
         metadata_err = {
             "attack_version": ver_str,
@@ -2131,26 +2226,28 @@ def _search_techniques_all_domains(
             "unavailable_domains": list(unavailable_domains),
             "limitations": limitations,
         }
-        return {
-            "found": False,
-            "error_code": "DOMAIN_UNAVAILABLE",
-            "domain": "all",
-            "domains_searched": list(DOMAINS),
-            "count": 0,
-            "total_count": 0,
-            "offset": safe_offset,
-            "limit": safe_limit,
-            "has_more": False,
-            "next_offset": None,
-            "techniques": [],
-            "domain_status": domain_status,
-            "metadata": metadata_err,
-            "formatted": "",
-            "message": (
-                f"Cross-domain search failed closed because domain(s) "
-                f"{', '.join(unavailable_domains)} are unavailable."
-            ),
-        }
+        return _finalize_response(
+            {
+                "found": False,
+                "error_code": "DOMAIN_UNAVAILABLE",
+                "domain": "all",
+                "domains_searched": list(DOMAINS),
+                "count": 0,
+                "total_count": 0,
+                "offset": safe_offset,
+                "limit": safe_limit,
+                "has_more": False,
+                "next_offset": None,
+                "techniques": [],
+                "domain_status": domain_status,
+                "metadata": metadata_err,
+                "formatted": "",
+                "message": (
+                    f"Cross-domain search failed closed because domain(s) "
+                    f"{', '.join(unavailable_domains)} are unavailable."
+                ),
+            }
+        )
 
     metadata_ok = {
         "attack_version": ver_str,
@@ -2167,23 +2264,25 @@ def _search_techniques_all_domains(
     }
 
     if not query_lower:
-        return {
-            "domain": "all",
-            "domains_searched": list(DOMAINS),
-            "count": 0,
-            "total_count": 0,
-            "offset": safe_offset,
-            "limit": safe_limit,
-            "has_more": False,
-            "next_offset": None,
-            "techniques": [],
-            "domain_status": domain_status,
-            "metadata": metadata_ok,
-            "formatted": "",
-            "message": (
-                f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'."
-            ),
-        }
+        return _finalize_response(
+            {
+                "domain": "all",
+                "domains_searched": list(DOMAINS),
+                "count": 0,
+                "total_count": 0,
+                "offset": safe_offset,
+                "limit": safe_limit,
+                "has_more": False,
+                "next_offset": None,
+                "techniques": [],
+                "domain_status": domain_status,
+                "metadata": metadata_ok,
+                "formatted": "",
+                "message": (
+                    f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'."
+                ),
+            }
+        )
 
     # Collect matches per domain without collapsing same name or same attack_id across domains
     matched_records: List[Tuple[str, Any, Optional[str], str, str]] = []
@@ -2220,45 +2319,49 @@ def _search_techniques_all_domains(
         metadata_ok["partial"] = len(unavailable_domains) < len(DOMAINS)
         metadata_ok["unavailable_domains"] = list(unavailable_domains)
         metadata_ok["freshness_status"] = "incomplete_missing_domain_bundle"
-        return {
-            "found": False,
-            "error_code": "DOMAIN_UNAVAILABLE",
-            "domain": "all",
-            "domains_searched": list(DOMAINS),
-            "count": 0,
-            "total_count": 0,
-            "offset": safe_offset,
-            "limit": safe_limit,
-            "has_more": False,
-            "next_offset": None,
-            "techniques": [],
-            "domain_status": domain_status,
-            "metadata": metadata_ok,
-            "formatted": "",
-            "message": (
-                f"Cross-domain search failed closed because domain(s) "
-                f"{', '.join(unavailable_domains)} failed during retrieval."
-            ),
-        }
+        return _finalize_response(
+            {
+                "found": False,
+                "error_code": "DOMAIN_UNAVAILABLE",
+                "domain": "all",
+                "domains_searched": list(DOMAINS),
+                "count": 0,
+                "total_count": 0,
+                "offset": safe_offset,
+                "limit": safe_limit,
+                "has_more": False,
+                "next_offset": None,
+                "techniques": [],
+                "domain_status": domain_status,
+                "metadata": metadata_ok,
+                "formatted": "",
+                "message": (
+                    f"Cross-domain search failed closed because domain(s) "
+                    f"{', '.join(unavailable_domains)} failed during retrieval."
+                ),
+            }
+        )
 
     if not matched_records:
-        return {
-            "domain": "all",
-            "domains_searched": list(DOMAINS),
-            "count": 0,
-            "total_count": 0,
-            "offset": safe_offset,
-            "limit": safe_limit,
-            "has_more": False,
-            "next_offset": None,
-            "techniques": [],
-            "domain_status": domain_status,
-            "metadata": metadata_ok,
-            "formatted": "",
-            "message": (
-                f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'."
-            ),
-        }
+        return _finalize_response(
+            {
+                "domain": "all",
+                "domains_searched": list(DOMAINS),
+                "count": 0,
+                "total_count": 0,
+                "offset": safe_offset,
+                "limit": safe_limit,
+                "has_more": False,
+                "next_offset": None,
+                "techniques": [],
+                "domain_status": domain_status,
+                "metadata": metadata_ok,
+                "formatted": "",
+                "message": (
+                    f"No techniques across domains ({', '.join(DOMAINS)}) matched the query '{query}'."
+                ),
+            }
+        )
 
     # Deterministic global sort: name ascending, domain rank (enterprise, mobile, ics), attack_id, stix_id
     matched_sorted = sorted(
@@ -2302,24 +2405,26 @@ def _search_techniques_all_domains(
     per_dom_summary = ", ".join(
         f"{dom}={domain_status[dom]['match_count']}" for dom in DOMAINS
     )
-    return {
-        "domain": "all",
-        "domains_searched": list(DOMAINS),
-        "count": len(structured),
-        "total_count": total_count,
-        "offset": safe_offset,
-        "limit": safe_limit,
-        "has_more": has_more,
-        "next_offset": next_offset,
-        "techniques": structured,
-        "domain_status": domain_status,
-        "metadata": metadata_ok,
-        "formatted": formatted,
-        "message": (
-            f"Found {total_count} technique(s) across domains ({per_dom_summary}) "
-            f"matching query '{query}' (returning {len(structured)} at offset {safe_offset})."
-        ),
-    }
+    return _finalize_response(
+        {
+            "domain": "all",
+            "domains_searched": list(DOMAINS),
+            "count": len(structured),
+            "total_count": total_count,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": has_more,
+            "next_offset": next_offset,
+            "techniques": structured,
+            "domain_status": domain_status,
+            "metadata": metadata_ok,
+            "formatted": formatted,
+            "message": (
+                f"Found {total_count} technique(s) across domains ({per_dom_summary}) "
+                f"matching query '{query}' (returning {len(structured)} at offset {safe_offset})."
+            ),
+        }
+    )
 
 
 @mcp.tool()
@@ -2339,6 +2444,7 @@ async def search_techniques(
     limit: PageLimit = DEFAULT_PAGE_LIMIT,
     offset: PageOffset = 0,
     include_formatted: bool = True,
+    detail_level: CrossDomainDetailLevel = "full",
 ) -> Dict[str, Any]:
     """
     Search MITRE ATT&CK techniques by keyword in their name or description.
@@ -2356,12 +2462,20 @@ async def search_techniques(
       • Includes `domain_status` and `metadata` provenance (release version, source release
         date, source URLs, and freshness limitations) and fails closed (`DOMAIN_UNAVAILABLE`)
         if any domain bundle is missing or fails to load.
+      • Supports optional `detail_level='compact'` (or `'full'`, default `'full'`):
+        - `'full'` (default): returns full per-domain provenance in `domain_status` and
+          `limitations` in `metadata` (unchanged legacy response).
+        - `'compact'`: deduplicates shared release provenance into `metadata` (with
+          `source_url_template` so per-domain source URLs are derivable without repetition)
+          and trims `domain_status[dom]` to `status`, `available`, and `match_count` on healthy
+          domains while retaining full failure details on unavailable domains.
 
     Examples:
         - search_techniques("PowerShell")
         - search_techniques("credential dumping")
         - search_techniques("initial access", domain="enterprise")
         - search_techniques("Command", domain="all", limit=10, include_description=False, include_formatted=False)
+        - search_techniques("Screen Capture", domain="all", limit=10, include_description=False, include_formatted=False, detail_level="compact")
 
     Args:
         query: Text to search for in technique names and descriptions.
@@ -2371,6 +2485,8 @@ async def search_techniques(
         limit: Maximum number of items to return per page (1-200).
         offset: Zero-based starting index for pagination (>= 0).
         include_formatted: If False, omits the human-readable formatted block to save tokens.
+        detail_level: Cross-domain provenance detail level ("full" default, or "compact").
+                      Ignored for single-domain calls.
 
     Returns:
         {
@@ -2394,6 +2510,7 @@ async def search_techniques(
           "message": "<status summary>"
         }
     """
+    _validate_cross_domain_detail_level(detail_level)
     norm_domain = (domain or "enterprise").strip().lower()
     if norm_domain == "all":
         return _search_techniques_all_domains(
@@ -2402,6 +2519,7 @@ async def search_techniques(
             limit=limit,
             offset=offset,
             include_formatted=include_formatted,
+            detail_level=detail_level,
         )
 
     attack_data = get_attack_data(domain)
