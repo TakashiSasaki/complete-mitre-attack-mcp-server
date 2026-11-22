@@ -36,6 +36,12 @@ _DETECTION_COVERAGE_CAVEAT = (
     "or effectiveness in any specific environment. Technique associations in ATT&CK "
     "do not constitute proof of specific CVE exploitation."
 )
+_MITIGATION_COVERAGE_CAVEAT = (
+    "ATT&CK mitigations (course-of-action, Mxxxx) provide reference defensive guidance "
+    "for reducing risk or addressing technique behaviors, not a guarantee of prevention "
+    "or complete remediation in any specific environment. Technique associations in "
+    "ATT&CK do not constitute proof of specific CVE exploitation."
+)
 
 PageLimit = Annotated[
     int,
@@ -790,6 +796,97 @@ _LEGACY_TACTIC_MIGRATIONS: Dict[str, Dict[str, Any]] = {
 }
 
 _V20_DETECTION_CACHE: Dict[str, Dict[str, Any]] = {}
+_V20_MITIGATION_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _get_v20_mitigation_index(domain: str) -> Dict[str, Any]:
+    """Build and cache ATT&CK mitigation graph:
+    technique <-> course-of-action (mitigates relationship).
+    """
+    dom = (domain or "enterprise").strip().lower()
+    if dom in _V20_MITIGATION_CACHE:
+        return _V20_MITIGATION_CACHE[dom]
+
+    ad = get_attack_data(dom)
+    try:
+        mitigations = ad.get_mitigations(remove_revoked_deprecated=True) or []
+    except Exception:
+        mitigations = []
+    try:
+        relationships = ad.get_objects_by_type("relationship", remove_revoked_deprecated=True) or []
+    except Exception:
+        relationships = []
+    try:
+        all_techniques = ad.get_techniques(remove_revoked_deprecated=False) or []
+    except Exception:
+        all_techniques = []
+
+    tech_by_stix_id: Dict[str, Any] = {}
+    tech_by_attack_id: Dict[str, Any] = {}
+    tech_attack_id_by_id: Dict[str, Optional[str]] = {}
+    for tech in all_techniques:
+        t_obj = _unwrap_stix_object(tech)
+        t_id = _stix_get(t_obj, "id")
+        if not t_id:
+            continue
+        t_id_lower = str(t_id).lower()
+        tech_by_stix_id[t_id_lower] = t_obj
+        t_aid: Optional[str] = None
+        for ref in (_stix_get(t_obj, "external_references") or []):
+            src_name = ref.get("source_name") if isinstance(ref, dict) else getattr(ref, "source_name", None)
+            ext_id = ref.get("external_id") if isinstance(ref, dict) else getattr(ref, "external_id", None)
+            if ext_id and src_name in ("mitre-attack", "mitre-ics-attack", "mitre-mobile-attack"):
+                t_aid = str(ext_id).strip().upper()
+                break
+        if t_aid is None:
+            for ref in (_stix_get(t_obj, "external_references") or []):
+                ext_id = ref.get("external_id") if isinstance(ref, dict) else getattr(ref, "external_id", None)
+                if ext_id and _TECHNIQUE_ATTACK_ID_RE.match(str(ext_id).strip()):
+                    t_aid = str(ext_id).strip().upper()
+                    break
+        tech_attack_id_by_id[t_id] = t_aid
+        if t_aid:
+            existing = tech_by_attack_id.get(t_aid)
+            if existing is None or (
+                (_stix_get(existing, "revoked", False) or _stix_get(existing, "x_mitre_deprecated", False))
+                and not (_stix_get(t_obj, "revoked", False) or _stix_get(t_obj, "x_mitre_deprecated", False))
+            ):
+                tech_by_attack_id[t_aid] = t_obj
+
+    mit_by_id: Dict[str, Any] = {}
+    mit_attack_id_by_id: Dict[str, Optional[str]] = {}
+    for m in mitigations:
+        m_obj = _unwrap_stix_object(m)
+        m_id = _stix_get(m_obj, "id")
+        if not m_id:
+            continue
+        mit_by_id[m_id] = m_obj
+        try:
+            mit_attack_id_by_id[m_id] = ad.get_attack_id(m_id)
+        except Exception:
+            mit_attack_id_by_id[m_id] = None
+
+    tech_to_mits: Dict[str, List[str]] = {}
+    for rel in relationships:
+        if _stix_get(rel, "relationship_type") != "mitigates":
+            continue
+        src = _stix_get(rel, "source_ref")
+        tgt = _stix_get(rel, "target_ref")
+        if src in mit_by_id and tgt:
+            mlist = tech_to_mits.setdefault(tgt, [])
+            if src not in mlist:
+                mlist.append(src)
+
+    index = {
+        "tech_by_stix_id": tech_by_stix_id,
+        "tech_by_attack_id": tech_by_attack_id,
+        "tech_attack_id_by_id": tech_attack_id_by_id,
+        "mit_by_id": mit_by_id,
+        "mit_attack_id_by_id": mit_attack_id_by_id,
+        "tech_to_mits": tech_to_mits,
+    }
+    _V20_MITIGATION_CACHE[dom] = index
+    return index
 
 
 def _get_v20_detection_index(domain: str) -> Dict[str, Any]:
@@ -8821,25 +8918,548 @@ async def get_techniques_mitigated_by_mitigation(
     }
 
 
+def _build_mitigation_batch_metadata(
+    domain: str,
+    include_description: bool,
+    exists: Optional[bool] = None,
+    detail_level: str = "compact",
+) -> Dict[str, Any]:
+    """Build version, source provenance, and coverage caveat metadata for batch mitigation responses."""
+    if domain in DOMAINS:
+        prov = _build_domain_provenance(domain, exists=exists)
+    else:
+        prov = {
+            "loaded_version": None,
+            "stix_spec_version": "2.1",
+            "source_url": None,
+            "source_repository": _SOURCE_REPOSITORY_URL,
+            "source_release_date": None,
+            "freshness_status": "invalid_domain",
+        }
+    meta: Dict[str, Any] = {
+        "attack_version": prov.get("loaded_version") or str(release_info.LATEST_VERSION),
+        "domain": domain,
+        "source_url": prov.get("source_url"),
+        "source_release_date": prov.get("source_release_date"),
+        "freshness_status": prov.get("freshness_status"),
+        "detail_level": detail_level,
+        "max_batch_size": MAX_BATCH_DETECTION_TECHNIQUES,
+        "caveat": _MITIGATION_COVERAGE_CAVEAT,
+    }
+    if detail_level == "full":
+        meta["stix_spec_version"] = prov.get("stix_spec_version", "2.1")
+        meta["source_repository"] = prov.get("source_repository", _SOURCE_REPOSITORY_URL)
+        meta["include_description"] = bool(include_description)
+    elif include_description:
+        meta["include_description"] = bool(include_description)
+    return meta
+
+
+def _empty_mitigation_batch_coverage(detail_level: str = "compact") -> Dict[str, Any]:
+    if detail_level == "compact":
+        return {
+            "mitigations": {},
+            "edges": {
+                "technique_to_mitigation": {},
+            },
+        }
+    return {
+        "mitigations": [],
+        "edges": {
+            "technique_to_mitigation": [],
+        },
+    }
+
+
+def _get_mitigations_mitigating_technique_batch(
+    technique_stix_id: str,
+    technique_ids: Optional[List[str]],
+    domain: str,
+    include_description: bool,
+    detail_level: str = "compact",
+) -> Dict[str, Any]:
+    """Deterministic, deduplicated batch mitigation lookup for multiple techniques."""
+    dom = (domain or "enterprise").strip().lower()
+    level = (
+        (detail_level or "compact").strip().lower()
+        if isinstance(detail_level, str)
+        else str(detail_level).lower()
+    )
+
+    raw_tokens: List[str] = []
+    if isinstance(technique_stix_id, str) and technique_stix_id.strip():
+        raw_tokens.extend(part.strip() for part in technique_stix_id.split(","))
+    if technique_ids is not None:
+        for item in technique_ids:
+            if isinstance(item, str):
+                raw_tokens.extend(part.strip() for part in item.split(","))
+            elif item is not None:
+                raw_tokens.append(str(item).strip())
+
+    non_empty_tokens = [tok for tok in raw_tokens if tok]
+    requested_count = len(non_empty_tokens)
+
+    unique_tokens: List[str] = []
+    seen_tokens: set[str] = set()
+    dup_tokens: set[str] = set()
+    duplicates_removed_count = 0
+    for tok in non_empty_tokens:
+        canon = tok.lower() if "--" in tok else tok.upper()
+        if canon in seen_tokens:
+            dup_tokens.add(canon)
+            duplicates_removed_count += 1
+        else:
+            seen_tokens.add(canon)
+            unique_tokens.append(canon)
+
+    def _error_response(
+        error_code: str,
+        message: str,
+        techniques_list: Optional[List[Dict[str, Any]]] = None,
+        exists: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        eff_level = level if level in _VALID_BATCH_DETAIL_LEVELS else "compact"
+        tech_rows = techniques_list or []
+        unavail_count = sum(1 for t in tech_rows if t.get("status") == "UNAVAILABLE")
+        return {
+            "found": False,
+            "batch": True,
+            "detail_level": eff_level,
+            "domain": dom,
+            "error_code": error_code,
+            "count": 0,
+            "counts": {
+                "requested_inputs": requested_count,
+                "unique_inputs": len(unique_tokens),
+                "duplicates_removed": duplicates_removed_count,
+                "techniques_total": len(tech_rows),
+                "found": 0,
+                "valid_no_mitigation": 0,
+                "not_found": 0,
+                "invalid": 0,
+                "unavailable": unavail_count,
+                "mitigations": 0,
+            },
+            "duplicates_removed": sorted(dup_tokens),
+            "techniques": tech_rows,
+            "coverage": _empty_mitigation_batch_coverage(eff_level),
+            "metadata": _build_mitigation_batch_metadata(
+                dom,
+                include_description=include_description,
+                exists=exists,
+                detail_level=eff_level,
+            ),
+            "message": message,
+        }
+
+    if level not in _VALID_BATCH_DETAIL_LEVELS:
+        return _error_response(
+            "INVALID_DETAIL_LEVEL",
+            f"Invalid detail_level '{detail_level}'. Must be one of: {', '.join(_VALID_BATCH_DETAIL_LEVELS)}.",
+        )
+
+    if dom not in DOMAINS:
+        return _error_response(
+            "INVALID_DOMAIN",
+            f"Invalid domain '{dom}'. Must be one of: {', '.join(DOMAINS)}.",
+        )
+
+    if not unique_tokens:
+        return _error_response(
+            "EMPTY_INPUT",
+            (
+                "No technique IDs provided. Supply one or more ATT&CK technique IDs "
+                "(e.g., 'T1190,T1203') or STIX IDs ('attack-pattern--<uuid>')."
+            ),
+        )
+
+    if len(unique_tokens) > MAX_BATCH_DETECTION_TECHNIQUES:
+        return _error_response(
+            "BATCH_LIMIT_EXCEEDED",
+            (
+                f"Batch size {len(unique_tokens)} exceeds maximum allowed "
+                f"{MAX_BATCH_DETECTION_TECHNIQUES} unique technique IDs per call."
+            ),
+        )
+
+    stix_path = get_stix_path(dom)
+    if not stix_path.exists():
+        unavailable_rows = [
+            {
+                "input": tok,
+                "matched_inputs": [tok],
+                "status": "UNAVAILABLE",
+                "attack_id": None,
+                "name": None,
+                "stix_id": None,
+                "revoked": False,
+                "deprecated": False,
+                "mitigation_ids": [],
+                "error": f"STIX data for domain '{dom}' is not available.",
+            }
+            for tok in sorted(unique_tokens)
+        ]
+        return _error_response(
+            "DOMAIN_UNAVAILABLE",
+            f"STIX data for domain '{dom}' is not available.",
+            techniques_list=unavailable_rows,
+            exists=False,
+        )
+
+    try:
+        ad = get_attack_data(dom)
+        mit_idx = _get_v20_mitigation_index(dom)
+    except Exception as e:
+        unavailable_rows = [
+            {
+                "input": tok,
+                "matched_inputs": [tok],
+                "status": "UNAVAILABLE",
+                "attack_id": None,
+                "name": None,
+                "stix_id": None,
+                "revoked": False,
+                "deprecated": False,
+                "mitigation_ids": [],
+                "error": f"Failed to load mitigation data for domain '{dom}': {e}",
+            }
+            for tok in sorted(unique_tokens)
+        ]
+        return _error_response(
+            "DOMAIN_UNAVAILABLE",
+            f"Failed to load mitigation data for domain '{dom}': {e}",
+            techniques_list=unavailable_rows,
+            exists=False,
+        )
+
+    tech_by_stix_id = mit_idx.get("tech_by_stix_id", {})
+    tech_by_attack_id = mit_idx.get("tech_by_attack_id", {})
+    tech_aid_map = mit_idx.get("tech_attack_id_by_id", {})
+    mit_by_id = mit_idx.get("mit_by_id", {})
+    mit_aid_map = mit_idx.get("mit_attack_id_by_id", {})
+    tech_to_mits = mit_idx.get("tech_to_mits", {})
+
+    def _lookup_aid(cache_map: Dict[str, Optional[str]], stix_id: str) -> str:
+        aid = cache_map.get(stix_id)
+        if aid:
+            return str(aid)
+        try:
+            resolved = ad.get_attack_id(stix_id)
+            if resolved:
+                return str(resolved)
+        except Exception:
+            pass
+        return stix_id
+
+    resolved_by_stix: Dict[str, Dict[str, Any]] = {}
+    unresolved_rows: List[Dict[str, Any]] = []
+
+    mit_cov: Dict[str, Dict[str, Any]] = {}
+    edges_t_m: set[Tuple[str, str]] = set()
+
+    for tok in unique_tokens:
+        is_valid_syntax = bool(
+            _TECHNIQUE_ATTACK_ID_RE.match(tok) or _TECHNIQUE_STIX_ID_RE.match(tok)
+        )
+        if not is_valid_syntax:
+            unresolved_rows.append({
+                "input": tok,
+                "matched_inputs": [tok],
+                "status": "INVALID",
+                "attack_id": None,
+                "name": None,
+                "stix_id": None,
+                "revoked": False,
+                "deprecated": False,
+                "mitigation_ids": [],
+                "error": (
+                    f"Malformed or non-technique identifier '{tok}'. "
+                    "Expected Txxxx, Txxxx.xxx, or attack-pattern--<uuid>."
+                ),
+            })
+            continue
+
+        tech_obj = None
+        resolved_id = None
+        if "--" in tok:
+            tech_obj = tech_by_stix_id.get(tok.lower())
+        else:
+            tech_obj = tech_by_attack_id.get(tok.upper())
+        if tech_obj is not None:
+            resolved_id = _stix_get(tech_obj, "id")
+            err = None
+        else:
+            err = f"Technique '{tok}' not found in domain '{dom}'."
+        if resolved_id is None:
+            unresolved_rows.append({
+                "input": tok,
+                "matched_inputs": [tok],
+                "status": "NOT_FOUND",
+                "attack_id": tok if _TECHNIQUE_ATTACK_ID_RE.match(tok) else None,
+                "name": None,
+                "stix_id": tok if _TECHNIQUE_STIX_ID_RE.match(tok) else None,
+                "revoked": False,
+                "deprecated": False,
+                "mitigation_ids": [],
+                "error": err,
+            })
+            continue
+
+        if resolved_id in resolved_by_stix:
+            existing = resolved_by_stix[resolved_id]
+            if tok not in existing["matched_inputs"]:
+                existing["matched_inputs"].append(tok)
+                existing["matched_inputs"].sort()
+                existing["input"] = existing["matched_inputs"][0]
+            dup_tokens.add(tok)
+            duplicates_removed_count += 1
+            continue
+
+        tech_aid = tech_aid_map.get(resolved_id)
+        if tech_aid is None:
+            try:
+                tech_aid = ad.get_attack_id(resolved_id)
+            except Exception:
+                tech_aid = None
+        tech_key = str(tech_aid or resolved_id)
+        tech_name = _stix_get(tech_obj, "name")
+        is_revoked = bool(_stix_get(tech_obj, "revoked", False))
+        is_deprecated = bool(_stix_get(tech_obj, "x_mitre_deprecated", False))
+
+        t_m_ids: set[str] = set()
+        for m_stix_id in tech_to_mits.get(resolved_id, []):
+            m_obj = mit_by_id.get(m_stix_id)
+            if m_obj is None:
+                continue
+            m_aid = _lookup_aid(mit_aid_map, m_stix_id)
+            t_m_ids.add(m_aid)
+            edges_t_m.add((tech_key, m_aid))
+
+            m_entry = mit_cov.get(m_stix_id)
+            if m_entry is None:
+                m_entry = {
+                    "attack_id": m_aid,
+                    "name": _stix_get(m_obj, "name"),
+                    "stix_id": m_stix_id,
+                    "_technique_ids": set(),
+                }
+                if include_description:
+                    m_entry["description"] = _stix_get(m_obj, "description")
+                mit_cov[m_stix_id] = m_entry
+            m_entry["_technique_ids"].add(tech_key)
+
+        status = "FOUND" if t_m_ids else "VALID_NO_MITIGATION"
+        resolved_by_stix[resolved_id] = {
+            "input": tok,
+            "matched_inputs": [tok],
+            "status": status,
+            "attack_id": tech_aid,
+            "name": tech_name,
+            "stix_id": resolved_id,
+            "revoked": is_revoked,
+            "deprecated": is_deprecated,
+            "mitigation_ids": sorted(
+                t_m_ids, key=lambda x: _attack_id_sort_key(x, "", "")
+            ),
+            "error": None,
+        }
+
+    resolved_rows = sorted(
+        resolved_by_stix.values(),
+        key=lambda r: _attack_id_sort_key(r["attack_id"], r["name"], r["stix_id"]),
+    )
+    status_rank = {"NOT_FOUND": 1, "INVALID": 2, "UNAVAILABLE": 3}
+    unresolved_rows.sort(
+        key=lambda r: (status_rank.get(r["status"], 9), str(r["input"]))
+    )
+    techniques_out = resolved_rows + unresolved_rows
+
+    mit_out: List[Dict[str, Any]] = []
+    for entry in sorted(
+        mit_cov.values(),
+        key=lambda x: _attack_id_sort_key(x["attack_id"], x["name"], x["stix_id"]),
+    ):
+        item: Dict[str, Any] = {
+            "attack_id": entry["attack_id"],
+            "name": entry["name"],
+            "stix_id": entry["stix_id"],
+            "technique_ids": sorted(
+                entry["_technique_ids"], key=lambda x: _attack_id_sort_key(x, "", "")
+            ),
+        }
+        if include_description:
+            item["description"] = entry.get("description")
+        mit_out.append(item)
+
+    edges_out = {
+        "technique_to_mitigation": [
+            [t_id, m_id]
+            for t_id, m_id in sorted(
+                edges_t_m,
+                key=lambda p: (
+                    _attack_id_sort_key(p[0], "", ""),
+                    _attack_id_sort_key(p[1], "", ""),
+                ),
+            )
+        ]
+    }
+
+    found_count = sum(1 for r in techniques_out if r["status"] == "FOUND")
+    no_mit_count = sum(1 for r in techniques_out if r["status"] == "VALID_NO_MITIGATION")
+    not_found_count = sum(1 for r in techniques_out if r["status"] == "NOT_FOUND")
+    invalid_count = sum(1 for r in techniques_out if r["status"] == "INVALID")
+    unavail_count = sum(1 for r in techniques_out if r["status"] == "UNAVAILABLE")
+
+    any_resolved = (found_count + no_mit_count) > 0
+
+    if level == "compact":
+        compact_techniques: List[Dict[str, Any]] = []
+        for r in techniques_out:
+            if r["status"] in ("FOUND", "VALID_NO_MITIGATION"):
+                ct: Dict[str, Any] = {
+                    "attack_id": r["attack_id"] or r["stix_id"],
+                    "name": r["name"],
+                    "status": r["status"],
+                }
+                if r["revoked"]:
+                    ct["revoked"] = True
+                if r["deprecated"]:
+                    ct["deprecated"] = True
+                if len(r["matched_inputs"]) > 1:
+                    ct["matched_inputs"] = r["matched_inputs"]
+                compact_techniques.append(ct)
+            else:
+                compact_techniques.append({
+                    "input": r["input"],
+                    "status": r["status"],
+                    "error": r["error"],
+                })
+
+        compact_mit: Dict[str, Any] = {}
+        for item in mit_out:
+            if include_description:
+                compact_mit[item["attack_id"]] = {
+                    "name": item["name"],
+                    "description": item.get("description"),
+                }
+            else:
+                compact_mit[item["attack_id"]] = item["name"]
+
+        adj_t_m: Dict[str, List[str]] = {}
+        for src, dst in edges_out["technique_to_mitigation"]:
+            adj_t_m.setdefault(src, []).append(dst)
+
+        return {
+            "found": any_resolved,
+            "batch": True,
+            "detail_level": "compact",
+            "domain": dom,
+            "count": len(mit_out),
+            "counts": {
+                "requested_inputs": requested_count,
+                "unique_inputs": len(unique_tokens),
+                "duplicates_removed": duplicates_removed_count,
+                "techniques_total": len(techniques_out),
+                "found": found_count,
+                "valid_no_mitigation": no_mit_count,
+                "not_found": not_found_count,
+                "invalid": invalid_count,
+                "unavailable": unavail_count,
+                "mitigations": len(mit_out),
+            },
+            "duplicates_removed": sorted(dup_tokens),
+            "techniques": compact_techniques,
+            "coverage": {
+                "mitigations": compact_mit,
+                "edges": {
+                    "technique_to_mitigation": adj_t_m,
+                },
+            },
+            "metadata": _build_mitigation_batch_metadata(
+                dom,
+                include_description=include_description,
+                exists=True,
+                detail_level="compact",
+            ),
+            "message": (
+                f"Resolved {found_count + no_mit_count} of {len(techniques_out)} technique(s) "
+                f"in domain '{dom}': {len(mit_out)} unique mitigation(s)."
+            ),
+        }
+
+    return {
+        "found": any_resolved,
+        "batch": True,
+        "detail_level": "full",
+        "domain": dom,
+        "count": len(mit_out),
+        "counts": {
+            "requested_inputs": requested_count,
+            "unique_inputs": len(unique_tokens),
+            "duplicates_removed": duplicates_removed_count,
+            "techniques_total": len(techniques_out),
+            "found": found_count,
+            "valid_no_mitigation": no_mit_count,
+            "not_found": not_found_count,
+            "invalid": invalid_count,
+            "unavailable": unavail_count,
+            "mitigations": len(mit_out),
+        },
+        "duplicates_removed": sorted(dup_tokens),
+        "techniques": techniques_out,
+        "coverage": {
+            "mitigations": mit_out,
+            "edges": edges_out,
+        },
+        "metadata": _build_mitigation_batch_metadata(
+            dom,
+            include_description=include_description,
+            exists=True,
+            detail_level="full",
+        ),
+        "message": (
+            f"Resolved {found_count + no_mit_count} of {len(techniques_out)} technique(s) "
+            f"in domain '{dom}': {len(mit_out)} unique mitigation(s)."
+        ),
+    }
+
+
 @mcp.tool()
 async def get_mitigations_mitigating_technique(
-    technique_stix_id: str,
+    technique_stix_id: str = "",
     domain: str = "enterprise",
     include_description: bool = False,
     include_formatted: bool = True,
+    technique_ids: Optional[List[str]] = None,
+    detail_level: BatchDetailLevel = "compact",
 ) -> Dict[str, Any]:
     """
-    Get all mitigations that address a specific technique.
+    Get all mitigations (course-of-action, Mxxxx) that address one or more techniques.
 
-    Accepts either a STIX ID ("attack-pattern--UUID") or an ATT&CK ID (e.g., "T1190").
+    Single-technique mode (default when a single ID is passed via `technique_stix_id`
+    and `technique_ids` is omitted):
+      - Accepts a STIX ID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
+      - Preserves the exact single-technique response schema and formatted output.
+
+    Batch mode (triggered when `technique_ids` is provided OR `technique_stix_id`
+    contains comma-separated IDs such as "T1190,T1203,T1595.002"):
+      - Accepts up to 50 unique technique IDs (ATT&CK IDs and/or STIX IDs).
+      - Defaults to `detail_level='compact'` (token-efficient, deduplicated ID-indexed
+        mitigation coverage map `Mxxxx -> name` and adjacency edges `T -> [M...]`,
+        per-technique statuses, and provenance/caveat metadata).
+      - Set `detail_level='full'` for full mitigation objects with STIX IDs and
+        per-technique derived `mitigation_ids` lists.
 
     Args:
-        technique_stix_id: Technique STIX ID ("attack-pattern--UUID") or ATT&CK ID (e.g., "T1190").
+        technique_stix_id: Single technique STIX/ATT&CK ID (e.g., "T1190") or
+            comma-separated technique IDs (e.g., "T1190,T1203,T1595.002").
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Include mitigation descriptions.
-        include_formatted: If False, omits the human-readable formatted block to save tokens.
+        include_formatted: If False, omits the human-readable formatted block in single mode.
+        technique_ids: Optional list of technique STIX/ATT&CK IDs for batch lookup.
+        detail_level: Batch detail level ('compact' default, or 'full'). Ignored in single mode.
 
-    Returns (same schema as before):
+    Returns (single-technique mode):
       {
         "found": bool,
         "technique": {...} | null,
@@ -8849,6 +9469,18 @@ async def get_mitigations_mitigating_technique(
         "message": str
       }
     """
+    is_batch = technique_ids is not None or (
+        isinstance(technique_stix_id, str) and "," in technique_stix_id
+    )
+    if is_batch:
+        return _get_mitigations_mitigating_technique_batch(
+            technique_stix_id=technique_stix_id,
+            technique_ids=technique_ids,
+            domain=domain,
+            include_description=include_description,
+            detail_level=detail_level,
+        )
+
     attack_data = get_attack_data(domain)
 
     resolved_id, technique_obj, err = _resolve_stix_object(

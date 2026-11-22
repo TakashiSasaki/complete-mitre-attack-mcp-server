@@ -358,7 +358,7 @@ a STIX ID rather than an ATT&CK ID.
 | Tool | Description |
 |---|---|
 | `get_all_mitigations` | Get all mitigations |
-| `get_mitigations_mitigating_technique` | Mitigations for a technique |
+| `get_mitigations_mitigating_technique` | Mitigations (`course-of-action`, `Mxxxx`) addressing one or more techniques (single ID, comma-separated IDs, or `technique_ids` list; batch defaults to `detail_level='compact'` with optional `'full'`) |
 | `get_techniques_mitigated_by_mitigation` | Techniques mitigated by a mitigation |
 
 ### Tactics, data sources and ICS
