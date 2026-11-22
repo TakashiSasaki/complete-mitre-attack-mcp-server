@@ -826,6 +826,125 @@ _LEGACY_TACTIC_MIGRATIONS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+_REAL_WORLD_PLATFORM_HINTS: Dict[str, List[str]] = {
+    # NAS & storage appliances
+    "nas": ["Linux", "Network Devices"],
+    "qnap": ["Linux", "Network Devices"],
+    "synology": ["Linux", "Network Devices"],
+    "truenas": ["Linux", "Network Devices"],
+    "freenas": ["Linux", "Network Devices"],
+    "qts": ["Linux", "Network Devices"],
+    "dsm": ["Linux", "Network Devices"],
+    # Network devices, routers, Wi-Fi, firewalls
+    "router": ["Network Devices"],
+    "wi-fi": ["Network Devices"],
+    "wifi": ["Network Devices"],
+    "wireless": ["Network Devices"],
+    "access point": ["Network Devices"],
+    "firewall": ["Network Devices"],
+    "switch": ["Network Devices"],
+    "vpn": ["Network Devices"],
+    "gateway": ["Network Devices"],
+    "modem": ["Network Devices"],
+    "cisco": ["Network Devices"],
+    "juniper": ["Network Devices"],
+    "fortinet": ["Network Devices"],
+    "fortigate": ["Network Devices"],
+    "palo alto": ["Network Devices"],
+    "mikrotik": ["Network Devices"],
+    "openwrt": ["Network Devices"],
+    "dd-wrt": ["Network Devices"],
+    "ubiquiti": ["Network Devices"],
+    # Linux distributions
+    "ubuntu": ["Linux"],
+    "debian": ["Linux"],
+    "rhel": ["Linux"],
+    "red hat": ["Linux"],
+    "redhat": ["Linux"],
+    "centos": ["Linux"],
+    "rocky": ["Linux"],
+    "almalinux": ["Linux"],
+    "fedora": ["Linux"],
+    "suse": ["Linux"],
+    "opensuse": ["Linux"],
+    "alpine": ["Linux"],
+    "kali": ["Linux"],
+    "linux server": ["Linux"],
+    "ubuntu server": ["Linux"],
+    # Windows variants
+    "windows 10": ["Windows"],
+    "windows 11": ["Windows"],
+    "win10": ["Windows"],
+    "win11": ["Windows"],
+    "windows server": ["Windows"],
+    "active directory": ["Windows"],
+    # macOS variants
+    "osx": ["macOS"],
+    "os x": ["macOS"],
+    "macbook": ["macOS"],
+    # Containers & orchestration
+    "docker": ["Containers"],
+    "kubernetes": ["Containers"],
+    "k8s": ["Containers"],
+    "container": ["Containers"],
+    "podman": ["Containers"],
+    "openshift": ["Containers"],
+    # Cloud providers
+    "aws": ["IaaS", "SaaS", "Identity Provider"],
+    "amazon web services": ["IaaS", "SaaS", "Identity Provider"],
+    "azure": ["IaaS", "SaaS", "Identity Provider"],
+    "microsoft azure": ["IaaS", "SaaS", "Identity Provider"],
+    "gcp": ["IaaS", "SaaS", "Identity Provider"],
+    "google cloud": ["IaaS", "SaaS", "Identity Provider"],
+    "google cloud platform": ["IaaS", "SaaS", "Identity Provider"],
+    "oci": ["IaaS", "SaaS", "Identity Provider"],
+    "oracle cloud": ["IaaS", "SaaS", "Identity Provider"],
+    "cloud": ["IaaS", "SaaS", "Identity Provider"],
+    # Virtualization / hypervisors
+    "vmware": ["ESXi"],
+    "vsphere": ["ESXi"],
+    "vcenter": ["ESXi"],
+    "hypervisor": ["ESXi"],
+    # Identity / SaaS / Office suites
+    "okta": ["Identity Provider", "SaaS"],
+    "entra": ["Identity Provider", "SaaS"],
+    "entra id": ["Identity Provider", "SaaS"],
+    "m365": ["Office Suite", "SaaS", "Identity Provider"],
+    "microsoft 365": ["Office Suite", "SaaS", "Identity Provider"],
+    "o365": ["Office Suite", "SaaS", "Identity Provider"],
+}
+
+
+def _suggest_attack_platforms(
+    raw_platform: str,
+    available_platforms: List[str],
+) -> List[str]:
+    """Map real-world IT asset labels (e.g. 'QNAP', 'Ubuntu', 'Wi-Fi', 'AWS')
+    to valid ATT&CK platform names available in the requested domain.
+    """
+    norm = " ".join((raw_platform or "").strip().lower().split())
+    if not norm or not available_platforms:
+        return []
+
+    avail_by_lower = {p.lower(): p for p in available_platforms}
+    candidates: List[str] = []
+
+    if norm in _REAL_WORLD_PLATFORM_HINTS:
+        candidates.extend(_REAL_WORLD_PLATFORM_HINTS[norm])
+    else:
+        for term, plats in _REAL_WORLD_PLATFORM_HINTS.items():
+            if re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", norm):
+                candidates.extend(plats)
+
+    suggested: List[str] = []
+    seen: set[str] = set()
+    for plat in candidates:
+        canon = avail_by_lower.get(plat.lower())
+        if canon and canon not in seen:
+            seen.add(canon)
+            suggested.append(canon)
+    return suggested
+
 
 def _normalize_technique_platforms(
     platforms: Optional[List[str]],
@@ -7640,6 +7759,28 @@ async def get_all_datacomponents(
             ),
         ),
     ] = "",
+    include_log_sources: Annotated[
+        bool,
+        Field(
+            default=True,
+            description=(
+                "Whether to embed the full `log_sources` array on each returned data component. "
+                "Set False to return an empty `log_sources` list while keeping `log_source_count` "
+                "to save tokens when browsing many data components."
+            ),
+        ),
+    ] = True,
+    log_source_filter: Annotated[
+        str,
+        Field(
+            default="",
+            description=(
+                "Optional case-insensitive substring filter applied to each returned data "
+                "component's `log_sources` (`name` / `channel`) when `include_log_sources=True` "
+                "(e.g., 'linux', 'networkdevice', 'WinEventLog')."
+            ),
+        ),
+    ] = "",
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK data components in a domain.
@@ -7647,8 +7788,9 @@ async def get_all_datacomponents(
     Data components are specific telemetry aspects that can be monitored
     (e.g., "Process Creation", "File Modification", "Network Connection Creation").
     In ATT&CK v20.1, each data component exposes `log_sources` (`x_mitre_log_sources`,
-    listing concrete log source names and channels such as `auditd` or `Sysmon`),
-    while legacy `data_source_*` fields are preserved for backward compatibility.
+    listing concrete log source names and channels such as `auditd` or `Sysmon`) along
+    with `log_source_count`, while legacy `data_source_*` fields are preserved for
+    backward compatibility.
 
     Args:
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
@@ -7659,6 +7801,11 @@ async def get_all_datacomponents(
         include_formatted: If False, omits the human-readable formatted block to save tokens.
         query: Optional case-insensitive filter across attack_id (DCxxxx), name,
                description, and log_sources (name / channel).
+        include_log_sources: If False, returns `log_sources: []` while keeping
+                             `log_source_count` so callers can browse cheaply.
+        log_source_filter: Optional case-insensitive substring filter applied to each
+                           returned data component's `log_sources` (`name`/`channel`)
+                           when `include_log_sources=True`.
 
     Returns:
         {
@@ -7675,6 +7822,7 @@ async def get_all_datacomponents(
               "name": "<data component name>",
               "stix_id": "<x-mitre-data-component--UUID>",
               "description": "<text or null>",
+              "log_source_count": <int>,
               "log_sources": [{"name": "<log source>", "channel": "<channel>"}, ...],
               "data_source_stix_id": "<x-mitre-data-source--UUID or null>",
               "data_source_name": "<parent data source name or null>",
@@ -7690,6 +7838,8 @@ async def get_all_datacomponents(
     safe_limit, safe_offset = _validate_pagination(limit, offset)
     raw_query = (query or "").strip()
     query_lower = raw_query.lower()
+    raw_ls_filter = (log_source_filter or "").strip()
+    ls_filter_lower = raw_ls_filter.lower()
 
     try:
         datacomponents = attack_data.get_datacomponents(
@@ -7810,13 +7960,26 @@ async def get_all_datacomponents(
                 except Exception:
                     data_source_attack_id = None
 
+        if not include_log_sources:
+            out_log_sources: List[Dict[str, str]] = []
+        elif ls_filter_lower:
+            out_log_sources = [
+                ls
+                for ls in log_sources
+                if ls_filter_lower in ls.get("name", "").lower()
+                or ls_filter_lower in ls.get("channel", "").lower()
+            ]
+        else:
+            out_log_sources = log_sources
+
         structured.append(
             {
                 "attack_id": dc_aid_key or None,
                 "name": name,
                 "stix_id": stix_id,
                 "description": description,
-                "log_sources": log_sources,
+                "log_source_count": len(log_sources),
+                "log_sources": out_log_sources,
                 "data_source_stix_id": data_source_stix_id,
                 "data_source_name": data_source_name,
                 "data_source_attack_id": data_source_attack_id,
@@ -7834,6 +7997,11 @@ async def get_all_datacomponents(
     )
 
     query_clause = f" matching query '{raw_query}'" if query_lower else ""
+    ls_clause = (
+        f", log_source_filter='{raw_ls_filter}'"
+        if (include_log_sources and ls_filter_lower)
+        else (", include_log_sources=False" if not include_log_sources else "")
+    )
     return {
         "domain": domain,
         "count": len(structured),
@@ -7846,7 +8014,8 @@ async def get_all_datacomponents(
         "formatted": formatted,
         "message": (
             f"Found {total_count} data component(s) in domain '{domain}'{query_clause} "
-            f"(remove_revoked_deprecated={remove_revoked_deprecated}, returning {len(structured)} at offset {safe_offset})."
+            f"(remove_revoked_deprecated={remove_revoked_deprecated}{ls_clause}, "
+            f"returning {len(structured)} at offset {safe_offset})."
         ),
     }
 
@@ -9072,7 +9241,10 @@ async def get_techniques_by_platform(
     Supports case-insensitive platform matching (e.g., 'linux' -> 'Linux') and
     common legacy aliases ('Azure AD' -> 'Identity Provider', 'Network' -> 'Network Devices').
     When no techniques match, returns `available_platforms` listing valid platform names
-    for the requested domain so callers can self-correct in one step.
+    for the requested domain and `suggested_platforms` mapping common real-world IT asset
+    labels (e.g., 'QNAP'/'Synology'/'NAS' -> ['Linux', 'Network Devices'], 'Router'/'Wi-Fi'
+    -> ['Network Devices'], 'Ubuntu' -> ['Linux'], 'AWS'/'Azure'/'GCP' -> ['IaaS', 'SaaS',
+    'Identity Provider']) so callers can self-correct in one step without guessing.
 
     Args:
         platform: Platform name (e.g., 'Windows', 'Linux', 'macOS', 'Containers',
@@ -9135,6 +9307,7 @@ async def get_techniques_by_platform(
             "next_offset": None,
             "techniques": [],
             "available_platforms": available_platforms,
+            "suggested_platforms": [],
             "formatted": "",
             "message": (
                 f"No techniques found for platform '' "
@@ -9159,6 +9332,12 @@ async def get_techniques_by_platform(
     if not techniques:
         safe_limit, safe_offset = _validate_pagination(limit, offset)
         avail_str = ", ".join(available_platforms) if available_platforms else "none"
+        suggested_platforms = _suggest_attack_platforms(raw_plat, available_platforms)
+        hint_clause = (
+            f" Suggested ATT&CK platform(s) for '{raw_plat}': {', '.join(suggested_platforms)}."
+            if suggested_platforms
+            else ""
+        )
         return {
             "platform": canonical_platform,
             "count": 0,
@@ -9169,10 +9348,11 @@ async def get_techniques_by_platform(
             "next_offset": None,
             "techniques": [],
             "available_platforms": available_platforms,
+            "suggested_platforms": suggested_platforms,
             "formatted": "",
             "message": (
                 f"No techniques found for platform '{canonical_platform}' "
-                f"in domain '{domain}'. "
+                f"in domain '{domain}'.{hint_clause} "
                 f"Valid platforms for domain '{domain}': {avail_str}."
             ),
         }
