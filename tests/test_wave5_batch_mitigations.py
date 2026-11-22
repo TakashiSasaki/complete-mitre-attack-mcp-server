@@ -11,8 +11,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from mitreattack import release_info
 import mitre_mcp_server.server as srv
+
+_tc = unittest.TestCase()
 
 
 class TestWave5BatchMitigations(unittest.TestCase):
@@ -299,19 +303,7 @@ class TestWave5BatchMitigations(unittest.TestCase):
         self.assertFalse(bad_dom["found"])
         self.assertEqual(bad_dom["error_code"], "INVALID_DOMAIN")
 
-    def test_bounded_input_size_and_empty_input(self) -> None:
-        empty_cases = [
-            {"technique_ids": []},
-            {"technique_stix_id": " , , "},
-            {"technique_ids": ["", "   "]},
-        ]
-        for kwargs in empty_cases:
-            with self.subTest(kwargs=kwargs):
-                res = asyncio.run(srv.get_mitigations_mitigating_technique(**kwargs))
-                self.assertFalse(res["found"])
-                self.assertTrue(res["batch"])
-                self.assertEqual(res["error_code"], "EMPTY_INPUT")
-
+    def test_bounded_input_size_limit(self) -> None:
         too_many = [f"T{1000 + i}" for i in range(srv.MAX_BATCH_DETECTION_TECHNIQUES + 1)]
         over = asyncio.run(
             srv.get_mitigations_mitigating_technique(technique_ids=too_many, domain="enterprise")
@@ -494,6 +486,25 @@ class TestWave5BatchMitigations(unittest.TestCase):
         self.assertEqual(det_res["detail_level"], "compact")
         self.assertEqual(det_res["counts"]["found"], 3)
         self.assertEqual(det_res["counts"]["detection_strategies"], 3)
+
+
+EMPTY_INPUT_CASES = [
+    {"technique_ids": []},
+    {"technique_stix_id": " , , "},
+    {"technique_ids": ["", "   "]},
+]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    EMPTY_INPUT_CASES,
+    ids=["empty_list", "blank_comma_string", "blank_list_items"],
+)
+def test_empty_input(kwargs) -> None:
+    res = asyncio.run(srv.get_mitigations_mitigating_technique(**kwargs))
+    _tc.assertFalse(res["found"])
+    _tc.assertTrue(res["batch"])
+    _tc.assertEqual(res["error_code"], "EMPTY_INPUT")
 
 
 if __name__ == "__main__":

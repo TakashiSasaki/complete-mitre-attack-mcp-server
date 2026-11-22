@@ -11,8 +11,12 @@ import asyncio
 import json
 import unittest
 
+import pytest
+
 from mitreattack import release_info
 import mitre_mcp_server.server as srv
+
+_tc = unittest.TestCase()
 
 
 class TestWave3GenerateLayerTechniquesAndMultiIDs(unittest.TestCase):
@@ -119,25 +123,39 @@ class TestWave3GenerateLayerTechniquesAndMultiIDs(unittest.TestCase):
             sorted(mixed_ids, key=lambda tid: srv._attack_id_sort_key(tid, "", "")),
         )
 
-    def test_generate_layer_rejects_bad_and_missing_ids(self) -> None:
-        bad_cases = [
-            {"attack_id": ""},
-            {"attack_id": "   "},
-            {"attack_id": "INVALID"},
-            {"attack_id": "X9999"},
-            {"attack_id": "TA0001"},
-            {"attack_id": "T1190.abc"},
-            {"attack_ids": ["T1190", "BADID"]},
-            {"attack_id": "T999999"},
-            {"attack_ids": ["T1190", "T999999"]},
-            {"attack_id": "T1190", "domain": "invalid-domain"},
-        ]
-        for kwargs in bad_cases:
-            with self.subTest(kwargs=kwargs):
-                res = asyncio.run(srv.generate_layer(**kwargs))
-                self.assertFalse(res["success"], f"Expected failure for {kwargs}, got {res}")
-                self.assertIsNone(res["layer"])
-                self.assertEqual(res["count"], 0)
+WAVE3_BAD_LAYER_CASES = [
+    {"attack_id": ""},
+    {"attack_id": "   "},
+    {"attack_id": "INVALID"},
+    {"attack_id": "X9999"},
+    {"attack_id": "TA0001"},
+    {"attack_id": "T1190.abc"},
+    {"attack_ids": ["T1190", "BADID"]},
+    {"attack_id": "T999999"},
+    {"attack_ids": ["T1190", "T999999"]},
+    {"attack_id": "T1190", "domain": "invalid-domain"},
+]
+
+WAVE3_BAD_LAYER_IDS = [
+    "empty_attack_id",
+    "whitespace_attack_id",
+    "invalid_literal",
+    "unknown_prefix_X9999",
+    "tactic_id_TA0001",
+    "bad_subtechnique_suffix",
+    "attack_ids_with_bad_id",
+    "missing_technique_T999999",
+    "attack_ids_with_missing_technique",
+    "invalid_domain",
+]
+
+
+@pytest.mark.parametrize("kwargs", WAVE3_BAD_LAYER_CASES, ids=WAVE3_BAD_LAYER_IDS)
+def test_generate_layer_rejects_bad_and_missing_ids(kwargs) -> None:
+    res = asyncio.run(srv.generate_layer(**kwargs))
+    _tc.assertFalse(res["success"], f"Expected failure for {kwargs}, got {res}")
+    _tc.assertIsNone(res["layer"])
+    _tc.assertEqual(res["count"], 0)
 
 
 class TestWave3GroupRelationshipCompactAndAttributionFilter(unittest.TestCase):

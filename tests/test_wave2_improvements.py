@@ -8,6 +8,8 @@
 import asyncio
 import unittest
 
+import pytest
+
 from mitreattack import release_info
 import mitre_mcp_server.server as srv
 
@@ -24,6 +26,8 @@ WAVE2_PAGINATED_TOOLS = (
     "get_campaigns_using_technique",
     "get_campaigns_using_software",
 )
+
+_tc = unittest.TestCase()
 
 
 class TestWave2RelationshipPaginationAndSorting(unittest.TestCase):
@@ -44,74 +48,78 @@ class TestWave2RelationshipPaginationAndSorting(unittest.TestCase):
             self.assertEqual(props["offset"].get("minimum"), 0)
             self.assertEqual(props["include_formatted"].get("default"), True)
 
-    def test_pagination_sorting_and_include_formatted_across_all_10_tools(self) -> None:
-        cases = [
-            (srv.get_techniques_used_by_group, {"group_stix_id": "G0016"}, "techniques"),
-            (srv.get_group_techniques, {"group_name": "APT29"}, "techniques"),
-            (srv.get_software_used_by_group, {"group_stix_id": "G0016"}, "software"),
-            (srv.get_techniques_used_by_software, {"software_stix_id": "S0154"}, "techniques"),
-            (srv.get_techniques_used_by_group_software, {"group_stix_id": "G0016"}, "techniques"),
-            (srv.get_groups_using_technique, {"technique_stix_id": "T1059.001"}, "groups"),
-            (srv.get_groups_using_software, {"software_stix_id": "S0154"}, "groups"),
-            (srv.get_software_using_technique, {"technique_stix_id": "T1059.001"}, "software"),
-            (srv.get_campaigns_using_technique, {"technique_stix_id": "T1190"}, "campaigns"),
-            (srv.get_campaigns_using_software, {"software_stix_id": "S0154"}, "campaigns"),
+WAVE2_PAGINATION_CASES = [
+    (srv.get_techniques_used_by_group, {"group_stix_id": "G0016"}, "techniques"),
+    (srv.get_group_techniques, {"group_name": "APT29"}, "techniques"),
+    (srv.get_software_used_by_group, {"group_stix_id": "G0016"}, "software"),
+    (srv.get_techniques_used_by_software, {"software_stix_id": "S0154"}, "techniques"),
+    (srv.get_techniques_used_by_group_software, {"group_stix_id": "G0016"}, "techniques"),
+    (srv.get_groups_using_technique, {"technique_stix_id": "T1059.001"}, "groups"),
+    (srv.get_groups_using_software, {"software_stix_id": "S0154"}, "groups"),
+    (srv.get_software_using_technique, {"technique_stix_id": "T1059.001"}, "software"),
+    (srv.get_campaigns_using_technique, {"technique_stix_id": "T1190"}, "campaigns"),
+    (srv.get_campaigns_using_software, {"software_stix_id": "S0154"}, "campaigns"),
+]
+
+
+@pytest.mark.parametrize(
+    "fn, kwargs, list_key",
+    WAVE2_PAGINATION_CASES,
+    ids=[c[0].__name__ for c in WAVE2_PAGINATION_CASES],
+)
+def test_pagination_sorting_and_include_formatted_across_all_10_tools(fn, kwargs, list_key) -> None:
+    p0 = asyncio.run(
+        fn(
+            domain="enterprise",
+            include_description=False,
+            limit=3,
+            offset=0,
+            include_formatted=False,
+            **kwargs,
+        )
+    )
+    _tc.assertTrue(p0["found"])
+    _tc.assertGreater(p0["total_count"], 0)
+    _tc.assertEqual(p0["offset"], 0)
+    _tc.assertEqual(p0["limit"], 3)
+    _tc.assertEqual(p0["count"], min(3, p0["total_count"]))
+    _tc.assertEqual(len(p0[list_key]), p0["count"])
+    _tc.assertEqual(p0["formatted"], "")
+
+    if p0["total_count"] > 3:
+        _tc.assertTrue(p0["has_more"])
+        _tc.assertEqual(p0["next_offset"], 3)
+
+        p1 = asyncio.run(
+            fn(
+                domain="enterprise",
+                include_description=False,
+                limit=3,
+                offset=3,
+                include_formatted=True,
+                **kwargs,
+            )
+        )
+        _tc.assertEqual(p1["offset"], 3)
+        _tc.assertEqual(p1["total_count"], p0["total_count"])
+        _tc.assertTrue(p1["formatted"])
+        ids0 = {item["stix_id"] for item in p0[list_key]}
+        ids1 = {item["stix_id"] for item in p1[list_key]}
+        _tc.assertTrue(ids0.isdisjoint(ids1))
+
+        # Verify deterministic ascending attack_id ordering across page boundary
+        combined = p0[list_key] + p1[list_key]
+        keys = [
+            srv._attack_id_sort_key(i.get("attack_id"), i.get("name"), i.get("stix_id"))
+            for i in combined
         ]
+        _tc.assertEqual(keys, sorted(keys))
 
-        for fn, kwargs, list_key in cases:
-            with self.subTest(tool=fn.__name__):
-                p0 = asyncio.run(
-                    fn(
-                        domain="enterprise",
-                        include_description=False,
-                        limit=3,
-                        offset=0,
-                        include_formatted=False,
-                        **kwargs,
-                    )
-                )
-                self.assertTrue(p0["found"])
-                self.assertGreater(p0["total_count"], 0)
-                self.assertEqual(p0["offset"], 0)
-                self.assertEqual(p0["limit"], 3)
-                self.assertEqual(p0["count"], min(3, p0["total_count"]))
-                self.assertEqual(len(p0[list_key]), p0["count"])
-                self.assertEqual(p0["formatted"], "")
-
-                if p0["total_count"] > 3:
-                    self.assertTrue(p0["has_more"])
-                    self.assertEqual(p0["next_offset"], 3)
-
-                    p1 = asyncio.run(
-                        fn(
-                            domain="enterprise",
-                            include_description=False,
-                            limit=3,
-                            offset=3,
-                            include_formatted=True,
-                            **kwargs,
-                        )
-                    )
-                    self.assertEqual(p1["offset"], 3)
-                    self.assertEqual(p1["total_count"], p0["total_count"])
-                    self.assertTrue(p1["formatted"])
-                    ids0 = {item["stix_id"] for item in p0[list_key]}
-                    ids1 = {item["stix_id"] for item in p1[list_key]}
-                    self.assertTrue(ids0.isdisjoint(ids1))
-
-                    # Verify deterministic ascending attack_id ordering across page boundary
-                    combined = p0[list_key] + p1[list_key]
-                    keys = [
-                        srv._attack_id_sort_key(i.get("attack_id"), i.get("name"), i.get("stix_id"))
-                        for i in combined
-                    ]
-                    self.assertEqual(keys, sorted(keys))
-
-                # Invalid pagination bounds raise ValueError
-                with self.assertRaises(ValueError):
-                    asyncio.run(fn(domain="enterprise", limit=0, offset=0, **kwargs))
-                with self.assertRaises(ValueError):
-                    asyncio.run(fn(domain="enterprise", limit=10, offset=-1, **kwargs))
+    # Invalid pagination bounds raise ValueError
+    with _tc.assertRaises(ValueError):
+        asyncio.run(fn(domain="enterprise", limit=0, offset=0, **kwargs))
+    with _tc.assertRaises(ValueError):
+        asyncio.run(fn(domain="enterprise", limit=10, offset=-1, **kwargs))
 
 
 class TestWave2AnalyticsDataComponents(unittest.TestCase):
