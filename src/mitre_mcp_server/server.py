@@ -67,6 +67,19 @@ AttributionFilter = Annotated[
 ]
 
 _VALID_ATTRIBUTION_FILTERS = ("all", "direct", "campaign")
+_VALID_BATCH_DETAIL_LEVELS = ("compact", "full")
+
+BatchDetailLevel = Annotated[
+    Literal["compact", "full"],
+    Field(
+        default="compact",
+        description=(
+            "Batch response detail level: 'compact' (default; deduplicated ID-indexed "
+            "graph with names, platforms, adjacency edges, and provenance) or 'full' "
+            "(includes STIX IDs, per-technique derived ID lists, and log sources)."
+        ),
+    ),
+]
 
 
 def _validate_attribution_filter(attribution_filter: str) -> str:
@@ -11118,6 +11131,8 @@ def _build_detection_batch_metadata(
     domain: str,
     include_description: bool,
     exists: Optional[bool] = None,
+    detail_level: str = "compact",
+    include_log_sources: bool = False,
 ) -> Dict[str, Any]:
     """Build version, source provenance, and coverage caveat metadata for batch detection responses."""
     if domain in DOMAINS:
@@ -11131,21 +11146,39 @@ def _build_detection_batch_metadata(
             "source_release_date": None,
             "freshness_status": "invalid_domain",
         }
-    return {
+    meta: Dict[str, Any] = {
         "attack_version": prov.get("loaded_version") or str(release_info.LATEST_VERSION),
         "domain": domain,
-        "stix_spec_version": prov.get("stix_spec_version", "2.1"),
         "source_url": prov.get("source_url"),
-        "source_repository": prov.get("source_repository", _SOURCE_REPOSITORY_URL),
         "source_release_date": prov.get("source_release_date"),
         "freshness_status": prov.get("freshness_status"),
-        "include_description": bool(include_description),
+        "detail_level": detail_level,
         "max_batch_size": MAX_BATCH_DETECTION_TECHNIQUES,
         "caveat": _DETECTION_COVERAGE_CAVEAT,
     }
+    if detail_level == "full":
+        meta["stix_spec_version"] = prov.get("stix_spec_version", "2.1")
+        meta["source_repository"] = prov.get("source_repository", _SOURCE_REPOSITORY_URL)
+        meta["include_description"] = bool(include_description)
+        meta["include_log_sources"] = True
+    elif include_log_sources or include_description:
+        meta["include_description"] = bool(include_description)
+        meta["include_log_sources"] = bool(include_log_sources)
+    return meta
 
 
-def _empty_batch_coverage() -> Dict[str, Any]:
+def _empty_batch_coverage(detail_level: str = "compact") -> Dict[str, Any]:
+    if detail_level == "compact":
+        return {
+            "detection_strategies": {},
+            "analytics": {},
+            "data_components": {},
+            "edges": {
+                "technique_to_detection_strategy": {},
+                "detection_strategy_to_analytic": {},
+                "analytic_to_data_component": {},
+            },
+        }
     return {
         "detection_strategies": [],
         "analytics": [],
@@ -11163,9 +11196,13 @@ def _get_detection_strategies_batch(
     technique_ids: Optional[List[str]],
     domain: str,
     include_description: bool,
+    detail_level: str = "compact",
+    include_log_sources: bool = False,
 ) -> Dict[str, Any]:
     """Deterministic, deduplicated batch detection-strategy lookup for multiple techniques."""
     dom = (domain or "enterprise").strip().lower()
+    level = (detail_level or "compact").strip().lower() if isinstance(detail_level, str) else str(detail_level).lower()
+    eff_log_sources = bool(include_log_sources) or (level == "full")
 
     raw_tokens: List[str] = []
     if isinstance(technique_stix_id, str) and technique_stix_id.strip():
@@ -11199,11 +11236,13 @@ def _get_detection_strategies_batch(
         techniques_list: Optional[List[Dict[str, Any]]] = None,
         exists: Optional[bool] = None,
     ) -> Dict[str, Any]:
+        eff_level = level if level in _VALID_BATCH_DETAIL_LEVELS else "compact"
         tech_rows = techniques_list or []
         unavail_count = sum(1 for t in tech_rows if t.get("status") == "UNAVAILABLE")
         return {
             "found": False,
             "batch": True,
+            "detail_level": eff_level,
             "domain": dom,
             "error_code": error_code,
             "count": 0,
@@ -11223,12 +11262,22 @@ def _get_detection_strategies_batch(
             },
             "duplicates_removed": sorted(dup_tokens),
             "techniques": tech_rows,
-            "coverage": _empty_batch_coverage(),
+            "coverage": _empty_batch_coverage(eff_level),
             "metadata": _build_detection_batch_metadata(
-                dom, include_description=include_description, exists=exists
+                dom,
+                include_description=include_description,
+                exists=exists,
+                detail_level=eff_level,
+                include_log_sources=eff_log_sources,
             ),
             "message": message,
         }
+
+    if level not in _VALID_BATCH_DETAIL_LEVELS:
+        return _error_response(
+            "INVALID_DETAIL_LEVEL",
+            f"Invalid detail_level '{detail_level}'. Must be one of: {', '.join(_VALID_BATCH_DETAIL_LEVELS)}.",
+        )
 
     if dom not in DOMAINS:
         return _error_response(
@@ -11654,9 +11703,126 @@ def _get_detection_strategies_batch(
     unavail_count = sum(1 for r in techniques_out if r["status"] == "UNAVAILABLE")
 
     any_resolved = (found_count + no_det_count) > 0
+
+    if level == "compact":
+        compact_techniques: List[Dict[str, Any]] = []
+        for r in techniques_out:
+            if r["status"] in ("FOUND", "VALID_NO_DETECTION"):
+                ct: Dict[str, Any] = {
+                    "attack_id": r["attack_id"] or r["stix_id"],
+                    "name": r["name"],
+                    "status": r["status"],
+                }
+                if r["revoked"]:
+                    ct["revoked"] = True
+                if r["deprecated"]:
+                    ct["deprecated"] = True
+                if len(r["matched_inputs"]) > 1:
+                    ct["matched_inputs"] = r["matched_inputs"]
+                compact_techniques.append(ct)
+            else:
+                compact_techniques.append({
+                    "input": r["input"],
+                    "status": r["status"],
+                    "error": r["error"],
+                })
+
+        compact_ds: Dict[str, Any] = {}
+        for item in ds_out:
+            if include_description:
+                compact_ds[item["attack_id"]] = {
+                    "name": item["name"],
+                    "description": item.get("description"),
+                }
+            else:
+                compact_ds[item["attack_id"]] = item["name"]
+
+        compact_an: Dict[str, Any] = {}
+        for item in an_out:
+            an_val: Dict[str, Any] = {
+                "name": item["name"],
+                "platforms": item["platforms"],
+            }
+            if eff_log_sources:
+                an_val["log_sources"] = item["log_sources"]
+            if include_description:
+                an_val["description"] = item.get("description")
+            compact_an[item["attack_id"]] = an_val
+
+        compact_dc: Dict[str, Any] = {}
+        for item in dc_out:
+            if eff_log_sources:
+                compact_dc[item["attack_id"]] = {
+                    "name": item["name"],
+                    "log_sources": item["log_sources"],
+                }
+            else:
+                compact_dc[item["attack_id"]] = item["name"]
+
+        def _build_adj(pairs: List[List[str]]) -> Dict[str, List[str]]:
+            adj: Dict[str, List[str]] = {}
+            for src, dst in pairs:
+                adj.setdefault(src, []).append(dst)
+            return adj
+
+        compact_edges = {
+            "technique_to_detection_strategy": _build_adj(
+                edges_out["technique_to_detection_strategy"]
+            ),
+            "detection_strategy_to_analytic": _build_adj(
+                edges_out["detection_strategy_to_analytic"]
+            ),
+            "analytic_to_data_component": _build_adj(
+                edges_out["analytic_to_data_component"]
+            ),
+        }
+
+        return {
+            "found": any_resolved,
+            "batch": True,
+            "detail_level": "compact",
+            "domain": dom,
+            "count": len(ds_out),
+            "counts": {
+                "requested_inputs": requested_count,
+                "unique_inputs": len(unique_tokens),
+                "duplicates_removed": duplicates_removed_count,
+                "techniques_total": len(techniques_out),
+                "found": found_count,
+                "valid_no_detection": no_det_count,
+                "not_found": not_found_count,
+                "invalid": invalid_count,
+                "unavailable": unavail_count,
+                "detection_strategies": len(ds_out),
+                "analytics": len(an_out),
+                "data_components": len(dc_out),
+            },
+            "duplicates_removed": sorted(dup_tokens),
+            "techniques": compact_techniques,
+            "coverage": {
+                "detection_strategies": compact_ds,
+                "analytics": compact_an,
+                "data_components": compact_dc,
+                "edges": compact_edges,
+            },
+            "metadata": _build_detection_batch_metadata(
+                dom,
+                include_description=include_description,
+                exists=True,
+                detail_level="compact",
+                include_log_sources=eff_log_sources,
+            ),
+            "message": (
+                f"Resolved {found_count + no_det_count} of {len(techniques_out)} technique(s) "
+                f"in domain '{dom}': {len(ds_out)} unique detection strategy(ies), "
+                f"{len(an_out)} analytic(s), {len(dc_out)} data component(s)."
+            ),
+        }
+
     return {
         "found": any_resolved,
         "batch": True,
+        "detail_level": "full",
         "domain": dom,
         "count": len(ds_out),
         "counts": {
@@ -11682,7 +11848,11 @@ def _get_detection_strategies_batch(
             "edges": edges_out,
         },
         "metadata": _build_detection_batch_metadata(
-            dom, include_description=include_description, exists=True
+            dom,
+            include_description=include_description,
+            exists=True,
+            detail_level="full",
+            include_log_sources=True,
         ),
         "message": (
             f"Resolved {found_count + no_det_count} of {len(techniques_out)} technique(s) "
@@ -11698,6 +11868,8 @@ async def get_detection_strategies_for_technique(
     domain: str = "enterprise",
     include_description: bool = False,
     technique_ids: Optional[List[str]] = None,
+    detail_level: BatchDetailLevel = "compact",
+    include_log_sources: bool = False,
 ) -> Dict[str, Any]:
     """
     Get ATT&CK v20.1 detection strategies (DETxxxx), analytics (ANxxxx), and
@@ -11711,10 +11883,12 @@ async def get_detection_strategies_for_technique(
     Batch mode (triggered when `technique_ids` is provided OR `technique_stix_id`
     contains comma-separated IDs such as "T1190,T1059.001,T1003"):
       - Accepts up to 50 unique technique IDs (ATT&CK IDs and/or STIX IDs).
-      - Returns deterministic, deduplicated per-technique mappings (with explicit
-        FOUND / VALID_NO_DETECTION / NOT_FOUND / INVALID / UNAVAILABLE statuses),
-        unique aggregated DET/AN/DC coverage with explicit association edges,
-        and release/provenance metadata with coverage caveat.
+      - Defaults to `detail_level='compact'` (token-efficient, normalized ID-indexed
+        coverage maps and adjacency edges `T->DET->AN->DC`, per-technique statuses,
+        platforms, and provenance/caveat metadata).
+      - Set `detail_level='full'` for full objects with STIX IDs, per-technique derived
+        ID lists, and log sources (or `include_log_sources=True` to add log sources in
+        compact mode).
 
     Args:
         technique_stix_id: Single technique STIX/ATT&CK ID (e.g., "T1190") or
@@ -11722,6 +11896,8 @@ async def get_detection_strategies_for_technique(
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Whether to include strategy and analytic descriptions.
         technique_ids: Optional list of technique STIX/ATT&CK IDs for batch lookup.
+        detail_level: Batch detail level ('compact' default, or 'full'). Ignored in single mode.
+        include_log_sources: Include log source names in compact batch mode (always included in 'full').
     """
     is_batch = technique_ids is not None or (
         isinstance(technique_stix_id, str) and "," in technique_stix_id
@@ -11732,6 +11908,8 @@ async def get_detection_strategies_for_technique(
             technique_ids=technique_ids,
             domain=domain,
             include_description=include_description,
+            detail_level=detail_level,
+            include_log_sources=include_log_sources,
         )
 
     ad = get_attack_data(domain)

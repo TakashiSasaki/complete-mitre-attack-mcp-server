@@ -377,7 +377,7 @@ a STIX ID rather than an ATT&CK ID.
 | `get_techniques_detected_by_datacomponent` | Techniques a data component can detect |
 | `get_procedure_examples_by_technique` | Procedure examples showing how groups used a technique |
 | `get_procedure_examples_by_tactic` | Procedure examples for all techniques in a tactic |
-| `get_detection_strategies_for_technique` | ATT&CK v20.1 detection strategies (`DETxxxx`), analytics (`ANxxxx`), and referenced data components (`DCxxxx`) for one or more techniques (single ID, comma-separated IDs, or `technique_ids` list) |
+| `get_detection_strategies_for_technique` | ATT&CK v20.1 detection strategies (`DETxxxx`), analytics (`ANxxxx`), and referenced data components (`DCxxxx`) for one or more techniques (single ID, comma-separated IDs, or `technique_ids` list; batch defaults to `detail_level='compact'` with optional `'full'` / `include_log_sources`) |
 | `get_analytics` | Search or list ATT&CK v20.1 analytics (`ANxxxx`) with optional `query`, `limit`/`offset` pagination, and `include_description` |
 
 ---
