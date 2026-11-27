@@ -1,0 +1,9 @@
+[Unit]
+Description=MCP readiness for %i
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/mcp-readiness/runtime.conf
+EnvironmentFile=%h/.config/mcp-readiness/%i.conf
+ExecStart=/usr/bin/env ${MCP_PROBE_PYTHON} ${MCP_PROBE_SCRIPT} ${MCP_PORT} ${MCP_SERVER} ${MCP_EXPECTED_TOOL} --caddy-host ${MCP_CADDY_HOST}
+TimeoutStartSec=25s

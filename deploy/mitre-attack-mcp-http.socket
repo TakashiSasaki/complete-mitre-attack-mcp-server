@@ -1,0 +1,9 @@
+[Unit]
+Description=MITRE ATT&CK MCP loopback listener
+
+[Socket]
+ListenStream=127.0.0.1:8789
+FileDescriptorName=mcp
+
+[Install]
+WantedBy=sockets.target

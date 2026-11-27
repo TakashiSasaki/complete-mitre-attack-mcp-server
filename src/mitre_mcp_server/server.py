@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Annotated, List, Literal, Tuple, Dict, Any, Optional
 import os
 import re
@@ -9,7 +12,7 @@ import sys
 
 from mitreattack import download_stix, release_info
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, ToolAnnotations
 from mitreattack.stix20 import MitreAttackData
 from pydantic import Field
 
@@ -1393,7 +1396,30 @@ def format_objects(
 # MCP server & first tool
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("mitre-attack-mcp-server")
+tool_access_log = logging.getLogger("mitre_mcp_server.tool_access")
+
+
+class LoggedFastMCP(FastMCP):
+    async def call_tool(self, name: str, arguments: dict[str, Any]):
+        started = perf_counter()
+        status = "error"
+        try:
+            result = await super().call_tool(name, arguments)
+            if not isinstance(result, CallToolResult) or not result.isError:
+                status = "ok"
+            return result
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        finally:
+            tool_name = name if re.fullmatch(r"[a-zA-Z0-9_]{1,64}", name) else "<invalid>"
+            tool_access_log.info(
+                "mcp_tool name=%s status=%s duration_ms=%.2f",
+                tool_name, status, (perf_counter() - started) * 1000,
+            )
+
+
+mcp = LoggedFastMCP("mitre-attack-mcp-server")
 
 READ_ONLY_LOCAL_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True,
@@ -13964,6 +13990,31 @@ async def get_analytics(
 # Entrypoint for MCP (used by pyproject.toml [project.scripts])
 # ---------------------------------------------------------------------------
 
+def _run_http(host: str, port: int) -> None:
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        mcp.run(transport="streamable-http")
+        return
+
+    import socket
+    import uvicorn
+
+    if os.environ.get("LISTEN_FDS") != "1":
+        raise RuntimeError("Expected one socket from systemd")
+    with socket.socket(fileno=3) as listener:
+        if listener.family not in (socket.AF_INET, socket.AF_INET6):
+            raise RuntimeError("Expected a TCP listener from systemd")
+        if listener.getsockname()[:2] != (host, port) or not listener.getsockopt(
+            socket.SOL_SOCKET, socket.SO_ACCEPTCONN
+        ):
+            raise RuntimeError("Inherited listener does not match the MCP host and port")
+        listener.set_inheritable(False)
+        config = uvicorn.Config(
+            mcp.streamable_http_app(), host=host, port=port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+        uvicorn.Server(config).run(sockets=[listener])
+
+
 def main() -> None:
     """
     Entrypoint for the mitre-mcp-server executable.
@@ -14000,8 +14051,12 @@ def main() -> None:
         mcp.settings.host = host
         mcp.settings.port = port
         mcp.settings.stateless_http = True
+        if not tool_access_log.handlers:
+            tool_access_log.addHandler(logging.StreamHandler())
+        tool_access_log.setLevel(logging.INFO)
+        tool_access_log.propagate = False
         print(f"Starting mitre-attack-mcp-server on streamable-http at {host}:{port}", file=sys.stderr)
-        mcp.run(transport="streamable-http")
+        _run_http(host, port)
     else:
         mcp.run()
 

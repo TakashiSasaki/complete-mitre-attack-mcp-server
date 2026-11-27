@@ -1,0 +1,11 @@
+[Unit]
+Description=Check MCP readiness for %i every five minutes
+
+[Timer]
+OnActiveSec=5s
+OnCalendar=*:0/5
+AccuracySec=1s
+RandomizedDelaySec=15s
+
+[Install]
+WantedBy=timers.target
